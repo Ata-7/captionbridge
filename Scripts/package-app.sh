@@ -63,6 +63,10 @@ cp "$BINARY" "$MACOS_DIR/$APP_NAME"
 cp "$ROOT_DIR/Packaging/CaptionBridge-Info.plist" "$CONTENTS_DIR/Info.plist"
 printf 'APPL????' > "$CONTENTS_DIR/PkgInfo"
 
+if [ -f "$ROOT_DIR/Packaging/AppIcon.icns" ]; then
+  cp "$ROOT_DIR/Packaging/AppIcon.icns" "$RESOURCES_DIR/AppIcon.icns"
+fi
+
 if [ -d "$ROOT_DIR/.build/arm64-apple-macosx/release/CaptionBridge_CaptionBridgeApp.bundle" ]; then
   cp -R "$ROOT_DIR/.build/arm64-apple-macosx/release/CaptionBridge_CaptionBridgeApp.bundle" "$RESOURCES_DIR/"
 fi

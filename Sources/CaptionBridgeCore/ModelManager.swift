@@ -39,7 +39,7 @@ public struct ModelDescriptor: Codable, Equatable, Sendable, Identifiable {
     public static let builtIn: [ModelDescriptor] = [
         ModelDescriptor(
             id: "ggml-base",
-            displayName: "Base multilingual",
+            displayName: "Base — fastest, lower accuracy (142 MB)",
             fileName: "ggml-base.bin",
             downloadURL: URL(string: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin")!,
             expectedSHA256: "60ed5bc3dd14eea856493d334349b405782ddcaf0028d4b5df4088345fba2efe",
@@ -48,7 +48,7 @@ public struct ModelDescriptor: Codable, Equatable, Sendable, Identifiable {
         ),
         ModelDescriptor(
             id: "ggml-small",
-            displayName: "Small multilingual (faster)",
+            displayName: "Small — fast, good quality (466 MB)",
             fileName: "ggml-small.bin",
             downloadURL: URL(string: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin")!,
             expectedSHA256: "1be3a9b2063867b937e64e2ec7483364a79917e157fa98c5d94b5c1fffea987b",
@@ -56,8 +56,17 @@ public struct ModelDescriptor: Codable, Equatable, Sendable, Identifiable {
             qualityTier: .balanced
         ),
         ModelDescriptor(
+            id: "ggml-medium-q5",
+            displayName: "Medium compact — near-best quality, low memory (514 MB)",
+            fileName: "ggml-medium-q5_0.bin",
+            downloadURL: URL(string: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium-q5_0.bin")!,
+            expectedSHA256: "19fea4b380c3a618ec4723c3eef2eb785ffba0d0538cf43f8f235e7b3b34220f",
+            minimumFileSizeBytes: 500_000_000,
+            qualityTier: .balanced
+        ),
+        ModelDescriptor(
             id: "ggml-medium",
-            displayName: "Medium multilingual (recommended)",
+            displayName: "Medium — best quality, recommended (1.5 GB)",
             fileName: "ggml-medium.bin",
             downloadURL: URL(string: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.bin")!,
             expectedSHA256: "6c14d5adee5f86394037b4e4e8b59f1673b6cee10e3cf0b11bbdbee79c156208",
@@ -210,8 +219,15 @@ private final class ModelDownloadDelegate: NSObject, URLSessionDownloadDelegate,
 }
 
 public actor ModelManager {
+    private struct ValidationRecord: Codable {
+        var size: Int64
+        var modifiedAt: TimeInterval
+    }
+
     private let modelsDirectory: URL
     private let descriptors: [ModelDescriptor]
+    private var activeDownloads: [String: Task<InstalledModel, Error>] = [:]
+    private var validationCache: [String: ValidationRecord]?
 
     public init(
         modelsDirectory: URL = CaptionBridgePaths.modelsURL,
@@ -238,6 +254,11 @@ public actor ModelManager {
         modelsDirectory.appendingPathComponent(descriptor.fileName)
     }
 
+    /// Returns the installed model, verifying integrity. The expensive
+    /// SHA-256 runs only the first time a given file is seen; afterwards an
+    /// unchanged size + modification date is proof enough, so app launches
+    /// and session starts don't re-hash gigabytes. A file that fails
+    /// verification is deleted so the next download can heal the install.
     public func installedModel(id: String) throws -> InstalledModel? {
         let descriptor = try descriptor(id: id)
         let url = localURL(for: descriptor)
@@ -245,7 +266,19 @@ public actor ModelManager {
             return nil
         }
 
-        try validateModel(at: url, descriptor: descriptor)
+        if isValidatedAndUnchanged(url: url, descriptor: descriptor) {
+            return InstalledModel(descriptor: descriptor, localURL: url)
+        }
+
+        do {
+            try validateModel(at: url, descriptor: descriptor)
+        } catch {
+            try? FileManager.default.removeItem(at: url)
+            forgetValidation(for: descriptor)
+            return nil
+        }
+
+        recordValidation(for: url, descriptor: descriptor)
         return InstalledModel(descriptor: descriptor, localURL: url)
     }
 
@@ -255,20 +288,34 @@ public actor ModelManager {
             return installed
         }
 
-        try FileManager.default.createDirectory(at: modelsDirectory, withIntermediateDirectories: true)
-
-        let destination = localURL(for: descriptor)
-        let temporaryURL = try await downloadModel(descriptor, progress: progress)
-        defer { try? FileManager.default.removeItem(at: temporaryURL) }
-
-        if FileManager.default.fileExists(atPath: destination.path) {
-            try FileManager.default.removeItem(at: destination)
+        if let existing = activeDownloads[descriptor.id] {
+            return try await existing.value
         }
-        try FileManager.default.moveItem(at: temporaryURL, to: destination)
-        try validateModel(at: destination, descriptor: descriptor)
-        progress?(1)
 
-        return InstalledModel(descriptor: descriptor, localURL: destination)
+        let task = Task<InstalledModel, Error> {
+            try FileManager.default.createDirectory(at: modelsDirectory, withIntermediateDirectories: true)
+
+            let destination = localURL(for: descriptor)
+            let temporaryURL = try await downloadModel(descriptor, progress: progress)
+            defer { try? FileManager.default.removeItem(at: temporaryURL) }
+
+            // Validate the download BEFORE it replaces anything, so a bad
+            // transfer can never leave a corrupt model installed.
+            try validateModel(at: temporaryURL, descriptor: descriptor)
+
+            if FileManager.default.fileExists(atPath: destination.path) {
+                try FileManager.default.removeItem(at: destination)
+            }
+            try FileManager.default.moveItem(at: temporaryURL, to: destination)
+            recordValidation(for: destination, descriptor: descriptor)
+            progress?(1)
+
+            return InstalledModel(descriptor: descriptor, localURL: destination)
+        }
+
+        activeDownloads[descriptor.id] = task
+        defer { activeDownloads[descriptor.id] = nil }
+        return try await task.value
     }
 
     public func validateModel(at url: URL, descriptor: ModelDescriptor) throws {
@@ -285,6 +332,63 @@ public actor ModelManager {
         let digest = try sha256Digest(for: url)
         guard digest.caseInsensitiveCompare(expected) == .orderedSame else {
             throw ModelManagerError.checksumMismatch(expected: expected, actual: digest)
+        }
+    }
+
+    private var validationCacheURL: URL {
+        modelsDirectory.appendingPathComponent(".validated-models.json")
+    }
+
+    private func loadValidationCache() -> [String: ValidationRecord] {
+        if let validationCache {
+            return validationCache
+        }
+
+        let loaded = (try? Data(contentsOf: validationCacheURL))
+            .flatMap { try? JSONDecoder().decode([String: ValidationRecord].self, from: $0) } ?? [:]
+        validationCache = loaded
+        return loaded
+    }
+
+    private func fileStats(at url: URL) -> ValidationRecord? {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path) else {
+            return nil
+        }
+
+        let size = (attributes[.size] as? NSNumber)?.int64Value ?? 0
+        let modified = (attributes[.modificationDate] as? Date)?.timeIntervalSinceReferenceDate ?? 0
+        return ValidationRecord(size: size, modifiedAt: modified)
+    }
+
+    private func isValidatedAndUnchanged(url: URL, descriptor: ModelDescriptor) -> Bool {
+        guard let record = loadValidationCache()[descriptor.fileName],
+              let stats = fileStats(at: url)
+        else {
+            return false
+        }
+
+        return stats.size == record.size && stats.modifiedAt == record.modifiedAt
+    }
+
+    private func recordValidation(for url: URL, descriptor: ModelDescriptor) {
+        guard let stats = fileStats(at: url) else {
+            return
+        }
+
+        var cache = loadValidationCache()
+        cache[descriptor.fileName] = stats
+        validationCache = cache
+        if let data = try? JSONEncoder().encode(cache) {
+            try? data.write(to: validationCacheURL, options: [.atomic])
+        }
+    }
+
+    private func forgetValidation(for descriptor: ModelDescriptor) {
+        var cache = loadValidationCache()
+        cache[descriptor.fileName] = nil
+        validationCache = cache
+        if let data = try? JSONEncoder().encode(cache) {
+            try? data.write(to: validationCacheURL, options: [.atomic])
         }
     }
 

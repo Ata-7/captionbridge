@@ -9,6 +9,7 @@ public enum AudioCaptureError: LocalizedError, Equatable {
     case teamsNotRunning
     case screenCapturePermissionDenied
     case microphonePermissionDenied
+    case microphoneUnavailable
     case sampleBufferMissingAudio
     case unsupportedFormat
 
@@ -22,6 +23,8 @@ public enum AudioCaptureError: LocalizedError, Equatable {
             return "CaptionBridge needs macOS Screen & System Audio Recording permission before it can listen to meeting audio."
         case .microphonePermissionDenied:
             return "CaptionBridge needs macOS Microphone permission before it can listen to microphone audio."
+        case .microphoneUnavailable:
+            return "No microphone is available. Connect an input device or choose System Audio."
         case .sampleBufferMissingAudio:
             return "ScreenCaptureKit delivered a buffer without readable audio."
         case .unsupportedFormat:
@@ -32,6 +35,7 @@ public enum AudioCaptureError: LocalizedError, Equatable {
 
 public final class SystemAudioCaptureService: NSObject, AudioCaptureService, @unchecked Sendable {
     public var onChunk: AudioChunkHandler?
+    public var onStopped: (@Sendable (Error?) -> Void)?
 
     private let outputQueue = DispatchQueue(label: "CaptionBridge.ScreenCaptureKit.Audio")
     private let targetSampleRate = 16_000
@@ -84,7 +88,9 @@ public final class SystemAudioCaptureService: NSObject, AudioCaptureService, @un
         }
 
         self.stream = nil
-        converter = nil
+        outputQueue.async { [weak self] in
+            self?.converter = nil
+        }
         try? await stream.stopCapture()
     }
 
@@ -122,7 +128,7 @@ public final class SystemAudioCaptureService: NSObject, AudioCaptureService, @un
 
             onChunk?(PCMAudioChunk(samples: samples, sampleRate: targetSampleRate))
         } catch {
-            onChunk?(PCMAudioChunk(samples: [], sampleRate: targetSampleRate))
+            // One unreadable buffer is not a stream failure; skip it.
         }
     }
 
@@ -229,6 +235,7 @@ extension SystemAudioCaptureService: SCStreamOutput, SCStreamDelegate {
     }
 
     public func stream(_ stream: SCStream, didStopWithError error: Error) {
-        onChunk?(PCMAudioChunk(samples: [], sampleRate: targetSampleRate))
+        self.stream = nil
+        onStopped?(error)
     }
 }

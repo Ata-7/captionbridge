@@ -1,6 +1,9 @@
 import AppKit
 import CaptionBridgeCore
 import SwiftUI
+#if canImport(Translation)
+import Translation
+#endif
 
 @MainActor
 final class SubtitleOverlayController {
@@ -27,8 +30,12 @@ final class SubtitleOverlayController {
             return
         }
 
+        // Adopt the new size but keep the position the user dragged it to.
+        let metrics = Self.defaultOverlayFrame(for: viewModel.settings.subtitleOverlaySize)
+        var frame = panel.frame
+        frame.size = metrics.size
         panel.minSize = Self.minimumOverlaySize(for: viewModel.settings.subtitleOverlaySize)
-        panel.setFrame(Self.defaultOverlayFrame(for: viewModel.settings.subtitleOverlaySize), display: true, animate: false)
+        panel.setFrame(frame, display: true, animate: false)
         clampToVisibleScreen(panel)
     }
 
@@ -60,7 +67,10 @@ final class SubtitleOverlayController {
         panel.backgroundColor = .clear
         panel.hasShadow = false
         panel.minSize = Self.minimumOverlaySize(for: viewModel.settings.subtitleOverlaySize)
+        panel.isMovableByWindowBackground = true
         panel.contentView = hostingView
+        // Remember where the user left the overlay between launches.
+        panel.setFrameAutosaveName("CaptionBridgeOverlay")
 
         return panel
     }
@@ -144,6 +154,7 @@ struct SubtitleOverlayView: View {
             }
             .padding(.horizontal, metrics.horizontalPadding)
             .padding(.bottom, metrics.bottomPadding)
+            .background(instantDraftTranslationBridge)
 
             if hasCaptionContent {
                 Button {
@@ -160,6 +171,15 @@ struct SubtitleOverlayView: View {
                 .help("Jump to latest captions")
             }
         }
+    }
+
+    @ViewBuilder
+    private var instantDraftTranslationBridge: some View {
+        #if canImport(Translation)
+        if #available(macOS 15.0, *) {
+            InstantDraftTranslationBridge(viewModel: viewModel)
+        }
+        #endif
     }
 
     private func scrollableCaptionHistory(metrics: OverlayMetrics) -> some View {
@@ -442,6 +462,25 @@ private struct OverlayMetrics {
         }
     }
 }
+
+#if canImport(Translation)
+@available(macOS 15.0, *)
+private struct InstantDraftTranslationBridge: View {
+    @ObservedObject var viewModel: CaptionBridgeViewModel
+    @State private var configuration = TranslationSession.Configuration(
+        source: Locale.Language(identifier: "fr"),
+        target: Locale.Language(identifier: "en")
+    )
+
+    var body: some View {
+        Color.clear
+            .frame(width: 0, height: 0)
+            .translationTask(configuration) { session in
+                await viewModel.runInstantDraftTranslation(session: session)
+            }
+    }
+}
+#endif
 
 struct DragHandle: NSViewRepresentable {
     func makeNSView(context: Context) -> DragHandleView {

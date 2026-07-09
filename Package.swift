@@ -9,8 +9,7 @@ let package = Package(
     ],
     products: [
         .library(name: "CaptionBridgeCore", targets: ["CaptionBridgeCore"]),
-        .executable(name: "CaptionBridge", targets: ["CaptionBridgeApp"]),
-        .executable(name: "CaptionBridgeSmokeTests", targets: ["CaptionBridgeSmokeTests"])
+        .executable(name: "CaptionBridge", targets: ["CaptionBridgeApp"])
     ],
     targets: [
         .target(
@@ -23,10 +22,6 @@ let package = Package(
             resources: [
                 .process("Resources")
             ]
-        ),
-        .executableTarget(
-            name: "CaptionBridgeSmokeTests",
-            dependencies: ["CaptionBridgeCore"]
         ),
         .testTarget(
             name: "CaptionBridgeCoreTests",

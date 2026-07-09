@@ -1,70 +1,119 @@
 # CaptionBridge
 
-CaptionBridge is a privacy-first macOS live subtitle translation MVP for French-to-English meeting audio.
+**Live, private French → English subtitles for any meeting on your Mac.**
 
-It was built around a practical workflow need: helping a user follow French conversations in English while keeping audio processing local by default.
+CaptionBridge listens to your Mac's system audio (Teams, Zoom, Meet, a browser tab — anything) and floats a subtitle overlay over your meeting: the French line appears as it's spoken, the polished English translation follows seconds later. Everything runs **100% on-device** — no cloud, no account, no audio ever leaves the Mac.
 
-## What It Does
+<p align="center">
+  <img src="docs/overlay.png" alt="CaptionBridge's floating overlay showing live French drafts and English translations" width="85%">
+</p>
+<p align="center"><em>The live overlay during a real captioning session: French appears as it's spoken, English follows — including a long sentence split mid-way and continued with "…".</em></p>
 
-- Captures meeting audio from system audio on macOS 14+.
-- Provides a microphone fallback when system audio capture is not available.
-- Uses a local Whisper-based helper for transcription and translation.
-- Displays captions in a floating overlay designed for fullscreen meeting apps.
-- Keeps the default workflow local: no saved transcript, no analytics, no cloud inference, and no raw audio persistence by default.
+## Why this exists
 
-## Why I Built It
+My wife works with a French-speaking team over Microsoft Teams. Company policy disables Teams' built-in transcription and translation, and her French is still intermediate — so she was spending meetings half-translating instead of participating.
 
-I built CaptionBridge as a practical AI-enabled workflow project. My focus was not to create a commercial product, but to understand how real AI tools move from a user problem into requirements, product decisions, privacy trade-offs, testing, and a usable prototype.
+Cloud captioning tools were off the table (meeting audio is confidential), so the solution had to be a **local-only** app: transcribe French speech on the Mac itself, translate it on the Mac itself, and show it as unobtrusive live subtitles that are easy to follow mid-meeting.
 
-## Current MVP Status
+I'm not a professional developer — I'm an operations/PMO professional who builds working software by directing AI coding tools. CaptionBridge was built with **OpenAI Codex** and then deeply revised — performance, stability, and a full multi-angle code review — with **Claude Code**. Every architectural decision (latency budgets, privacy constraints, failure recovery) was driven by watching the app in real meetings and iterating.
 
-The MVP currently supports French meeting audio to English subtitles. It includes native macOS controls, a floating subtitle overlay, local model management, caption stabilisation, and test coverage for core privacy, audio, and caption-processing behaviours.
+## Features
 
-## Tech Stack
+- **Floating subtitle overlay** that stays above fullscreen meeting apps, drag-anywhere, remembers its position, three sizes.
+- **Live French draft line** appears while the speaker is still talking; a **polished English final** lands at each pause.
+- **Instant English drafts** (macOS 15+): the live French line is additionally translated on-device with Apple Translation, so English updates mid-sentence instead of only at pauses.
+- **Any audio source**: system audio, Microsoft Teams specifically, or the microphone.
+- **Bilingual or English-only** display, plus an in-session transcript panel (never saved to disk).
+- **Local Whisper models** from 142 MB to 1.5 GB — pick your speed/quality/memory trade-off in the app; downloads are verified against pinned SHA-256 checksums.
+- **Self-healing captioning pipeline**: model stays loaded across the whole meeting, slow sentences never kill the translator, audio capture auto-reconnects if macOS interrupts it.
 
-- Swift and SwiftUI
-- AppKit overlay window
-- ScreenCaptureKit
-- AVAudioEngine
-- Swift Package Manager
-- Local Whisper helper based on whisper.cpp
+## Privacy, by construction
 
-## Local Development
+- Speech recognition and translation run in a bundled [whisper.cpp](https://github.com/ggerganov/whisper.cpp) process with Metal GPU acceleration — on your Mac, offline.
+- Optional instant English drafts use Apple's on-device Translation framework (the language pack downloads once from Apple; translation itself is offline).
+- No analytics, no accounts, no network use except the one-time model download from Hugging Face.
+- Captions live in memory for the current session only; nothing is written to disk.
 
-```sh
-swift test
-swift build
+## How it works
+
+```
+Meeting audio (ScreenCaptureKit / AVAudioEngine)
+        │  16 kHz mono PCM, ordered stream
+        ▼
+LiveSubtitleCoordinator (Swift actor)
+  • voice-activity gating + utterance windowing
+  • paces drafts to what the machine can sustain
+        │                       │
+        │ every ~0.6 s          │ at each pause
+        ▼                       ▼
+   French draft            English final
+ (Whisper transcribe)   (Whisper translate — single pass,
+        │                reuses the draft's French line)
+        ▼
+ Instant English draft (Apple Translation, macOS 15+)
+        │
+        ▼
+SwiftUI control window + AppKit floating overlay
 ```
 
-Build a local app bundle:
+The Whisper helper is a small C program that keeps the model **loaded in memory for the whole meeting** and answers transcription/translation requests over a pipe protocol with request IDs — so one slow sentence can only ever delay a caption, never force a multi-second model reload mid-meeting.
+
+## Install
+
+**Requirements:** Apple silicon Mac, macOS 14+ (macOS 15+ for instant English drafts).
+
+1. Download `CaptionBridge.dmg` from the [latest release](https://github.com/Ata-7/captionbridge/releases), open it, and drag CaptionBridge to Applications.
+2. First launch: the app is ad-hoc signed (not notarized), so **right-click → Open → Open**.
+3. In the app, download a model (see table below).
+4. Click **Start Subtitles** and grant *Screen & System Audio Recording* permission when macOS asks. Relaunch the app after granting.
+5. Play any French audio — captions appear in the overlay.
+
+### Which model should I pick?
+
+| Model | Size | Quality | Best for |
+|---|---|---|---|
+| Base | 142 MB | basic | very old/low-RAM Macs |
+| Small | 466 MB | good | fast captions on any Apple silicon |
+| **Medium compact** | **514 MB** | **near-best** | **MacBook Air / 8–16 GB Macs** |
+| Medium | 1.5 GB | best | Macs with 24 GB+ memory |
+
+On a fanless MacBook Air running Teams, **Medium compact** is the sweet spot: near-Medium accuracy with a third of the memory footprint and much faster load.
+
+## Build from source
+
+Requires full Xcode on Apple silicon.
 
 ```sh
-Scripts/package-app.sh
+swift test                          # unit tests
+python3 -m pip install --upgrade --target .build/python-packages cmake
+Scripts/bootstrap-whisper.cpp.sh    # builds whisper.cpp (Metal) once
+Scripts/package-app.sh              # builds dist/CaptionBridge.app
+Scripts/create-dmg.sh               # builds dist/CaptionBridge.dmg
 ```
 
-Create a local DMG for manual testing:
+End-to-end verification (synthesizes French speech, runs it through the real bundled helper, checks the English output):
 
 ```sh
-Scripts/create-dmg.sh
+Scripts/verify-local-translation.sh
 ```
 
-## Privacy Notes
+`Scripts/verify-live-system-audio.sh` additionally exercises the full live system-audio path once Screen & System Audio Recording permission is granted.
 
-CaptionBridge is designed with local-first defaults. The app does not save transcripts, does not persist raw audio, does not include analytics, and does not use cloud inference by default.
+## Built with AI, deliberately
 
-This is an MVP, not a production-certified privacy or security product.
+This repository is also a demonstration of a working method: **product thinking + AI pair-programming**.
 
-## Tests
+- v0.1 was built end-to-end with OpenAI Codex from a problem statement and iterative feedback.
+- v0.2 came from a structured Claude Code session: a 10-angle automated code review (correctness, concurrency, efficiency, security), micro-benchmarks of the actual Whisper helper to pick optimizations by measurement (one "obvious" optimization was rejected because the numbers said no), then fixes for every confirmed finding — including a process-lifecycle redesign that eliminated mid-meeting model reloads, a 2× faster final-caption path, and crash fixes for real-world edge cases.
 
-The project includes tests for privacy defaults, audio processing, caption stabilisation, subtitle history, model/helper lookup, and live subtitle coordination.
+The point isn't that AI wrote the code. It's that a clear problem, honest verification, and relentless iteration produce software that solves a real need — regardless of who types the semicolons.
 
-## Limitations
+## Roadmap
 
-- MVP language flow is French to English.
-- macOS 14+ is required for system audio capture.
-- Local model quality and latency depend on the selected model and hardware.
-- Distribution is currently suitable for local/manual testing, not notarised production release.
+- More language pairs (the pipeline is language-agnostic; UI and non-speech filters need generalizing)
+- Notarized releases with a Developer ID certificate
+- Saved transcripts as an explicit opt-in export
 
-## AI-Assisted Development
+## License
 
-This project was built with Codex-assisted development. I owned the problem definition, requirements, product decisions, testing, and iteration, using AI assistance to accelerate implementation and deepen my practical understanding of AI-enabled software workflows.
+[MIT](LICENSE) — © 2026 Mustafa Ataoğlu

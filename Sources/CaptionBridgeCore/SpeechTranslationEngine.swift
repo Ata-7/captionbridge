@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 public struct SpeechTranslationResult: Equatable, Sendable {
@@ -34,6 +35,21 @@ public protocol SpeechTranslationEngine: Sendable {
         model: InstalledModel,
         languagePair: LanguagePair
     ) async throws -> SpeechTranslationResult
+
+    /// Produces the final caption for an utterance. When `preferDualOutput`
+    /// is true the engine should also return the source-language transcript
+    /// (costlier); when false a translation-only pass is enough because the
+    /// caller already has source text from live drafts.
+    func translateFinal(
+        audio chunk: PCMAudioChunk,
+        model: InstalledModel,
+        languagePair: LanguagePair,
+        preferDualOutput: Bool
+    ) async throws -> SpeechTranslationResult
+
+    /// Loads the model ahead of the first real request so the first caption
+    /// of a session does not pay the cold-start cost. Best effort.
+    func warmUp(model: InstalledModel, languagePair: LanguagePair) async -> Bool
 }
 
 public extension SpeechTranslationEngine {
@@ -51,6 +67,19 @@ public extension SpeechTranslationEngine {
             endTime: translated.endTime,
             isFinal: translated.isFinal
         )
+    }
+
+    func translateFinal(
+        audio chunk: PCMAudioChunk,
+        model: InstalledModel,
+        languagePair: LanguagePair,
+        preferDualOutput: Bool
+    ) async throws -> SpeechTranslationResult {
+        try await translate(audio: chunk, model: model, languagePair: languagePair)
+    }
+
+    func warmUp(model: InstalledModel, languagePair: LanguagePair) async -> Bool {
+        true
     }
 }
 
@@ -152,7 +181,9 @@ public struct WhisperExecutableLocator: Sendable {
             "main",
             "build/bin/whisper-cli",
             "build/bin/main",
-            "bin/whisper-cli"
+            "bin/whisper-cli",
+            "source/build/bin/whisper-cli",
+            "source/build/bin/main"
         ]
 
         for root in searchRoots {
@@ -168,6 +199,11 @@ public struct WhisperExecutableLocator: Sendable {
     }
 }
 
+/// Routes requests to the persistent helper and falls back to the one-shot
+/// CLI engine only when the helper binary is missing entirely (development
+/// runs). Transient helper failures are NOT routed to the CLI: spawning
+/// whisper-cli reloads the model from disk per request, which is strictly
+/// worse than letting the persistent helper restart itself.
 public final class WhisperLiveTranslationEngine: SpeechTranslationEngine {
     private let persistentEngine: PersistentWhisperTranslationEngine
     private let fallbackEngine: WhisperCLITranslationEngine
@@ -187,14 +223,7 @@ public final class WhisperLiveTranslationEngine: SpeechTranslationEngine {
     ) async throws -> SpeechTranslationResult {
         do {
             return try await persistentEngine.transcribe(audio: chunk, model: model, languagePair: languagePair)
-        } catch let error as WhisperEngineError {
-            switch error {
-            case .executableNotFound, .failed:
-                return try await fallbackEngine.transcribe(audio: chunk, model: model, languagePair: languagePair)
-            case .emptyResult, .timedOut:
-                throw error
-            }
-        } catch {
+        } catch WhisperEngineError.executableNotFound {
             return try await fallbackEngine.transcribe(audio: chunk, model: model, languagePair: languagePair)
         }
     }
@@ -206,19 +235,42 @@ public final class WhisperLiveTranslationEngine: SpeechTranslationEngine {
     ) async throws -> SpeechTranslationResult {
         do {
             return try await persistentEngine.translate(audio: chunk, model: model, languagePair: languagePair)
-        } catch let error as WhisperEngineError {
-            switch error {
-            case .executableNotFound, .failed:
-                return try await fallbackEngine.translate(audio: chunk, model: model, languagePair: languagePair)
-            case .emptyResult, .timedOut:
-                throw error
-            }
-        } catch {
+        } catch WhisperEngineError.executableNotFound {
             return try await fallbackEngine.translate(audio: chunk, model: model, languagePair: languagePair)
         }
     }
+
+    public func translateFinal(
+        audio chunk: PCMAudioChunk,
+        model: InstalledModel,
+        languagePair: LanguagePair,
+        preferDualOutput: Bool
+    ) async throws -> SpeechTranslationResult {
+        do {
+            return try await persistentEngine.translateFinal(
+                audio: chunk,
+                model: model,
+                languagePair: languagePair,
+                preferDualOutput: preferDualOutput
+            )
+        } catch WhisperEngineError.executableNotFound {
+            return try await fallbackEngine.translate(audio: chunk, model: model, languagePair: languagePair)
+        }
+    }
+
+    public func warmUp(model: InstalledModel, languagePair: LanguagePair) async -> Bool {
+        await persistentEngine.warmUp(model: model, languagePair: languagePair)
+    }
 }
 
+/// Talks to the bundled persistent whisper.cpp helper over pipes.
+///
+/// Timeout design: a slow inference must never destroy the loaded model.
+/// Timers only resume the waiting caller with `.timedOut`; the helper process
+/// is left alive to finish, and the response it eventually writes is drained
+/// by the next request (responses carry request IDs). The process is killed
+/// only when it has made no observable progress for `stallKillInterval`,
+/// which indicates a genuine hang rather than a slow request.
 public final class PersistentWhisperTranslationEngine: SpeechTranslationEngine, @unchecked Sendable {
     private enum HelperRequestMode: String {
         case source
@@ -231,12 +283,37 @@ public final class PersistentWhisperTranslationEngine: SpeechTranslationEngine, 
         var process: Process?
         var input: FileHandle?
         var output: FileHandle?
+        var lastActivityAt = Date()
+        var isWorkerBusy = false
 
         var hasRunningProcess: Bool {
             lock.lock()
             let isRunning = process?.isRunning == true
             lock.unlock()
             return isRunning
+        }
+
+        func noteActivity() {
+            lock.lock()
+            lastActivityAt = Date()
+            lock.unlock()
+        }
+
+        func setWorkerBusy(_ busy: Bool) {
+            lock.lock()
+            isWorkerBusy = busy
+            if busy {
+                lastActivityAt = Date()
+            }
+            lock.unlock()
+        }
+
+        /// True when the worker has been waiting on the helper with zero
+        /// output for longer than `interval` — a hang, not a slow request.
+        func isStalled(beyond interval: TimeInterval) -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return isWorkerBusy && Date().timeIntervalSince(lastActivityAt) > interval
         }
 
         func clear() {
@@ -283,22 +360,26 @@ public final class PersistentWhisperTranslationEngine: SpeechTranslationEngine, 
     }
 
     private let locator: WhisperHelperLocator
-    private let helperURL: URL?
-    private let warmTimeoutSeconds: TimeInterval
-    private let coldStartTimeoutSeconds: TimeInterval
+    private let draftTimeoutSeconds: TimeInterval
+    private let finalTimeoutSeconds: TimeInterval
+    private let coldStartExtraSeconds: TimeInterval
+    private let stallKillInterval: TimeInterval
     private let requestQueue = DispatchQueue(label: "CaptionBridge.PersistentWhisperTranslationEngine")
     private let processState = ProcessState()
     private var requestCounter = 0
 
     public init(
         locator: WhisperHelperLocator = .default,
-        timeoutSeconds: TimeInterval = 6,
-        coldStartTimeoutSeconds: TimeInterval = 16
+        draftTimeoutSeconds: TimeInterval = 8,
+        finalTimeoutSeconds: TimeInterval = 45,
+        coldStartExtraSeconds: TimeInterval = 30,
+        stallKillInterval: TimeInterval = 25
     ) {
         self.locator = locator
-        self.helperURL = locator.locate()
-        self.warmTimeoutSeconds = timeoutSeconds
-        self.coldStartTimeoutSeconds = coldStartTimeoutSeconds
+        self.draftTimeoutSeconds = draftTimeoutSeconds
+        self.finalTimeoutSeconds = finalTimeoutSeconds
+        self.coldStartExtraSeconds = coldStartExtraSeconds
+        self.stallKillInterval = stallKillInterval
     }
 
     deinit {
@@ -321,24 +402,68 @@ public final class PersistentWhisperTranslationEngine: SpeechTranslationEngine, 
         try await request(audio: chunk, model: model, languagePair: languagePair, mode: .dual)
     }
 
+    public func translateFinal(
+        audio chunk: PCMAudioChunk,
+        model: InstalledModel,
+        languagePair: LanguagePair,
+        preferDualOutput: Bool
+    ) async throws -> SpeechTranslationResult {
+        try await request(
+            audio: chunk,
+            model: model,
+            languagePair: languagePair,
+            mode: preferDualOutput ? .dual : .translate
+        )
+    }
+
+    /// Loads the model by transcribing a short block of silence. Expected to
+    /// return no text; only `.executableNotFound` or process launch failures
+    /// count as a failed warm-up.
+    public func warmUp(model: InstalledModel, languagePair: LanguagePair) async -> Bool {
+        let silence = PCMAudioChunk(samples: [Float](repeating: 0, count: 8_000), sampleRate: 16_000)
+        do {
+            _ = try await request(audio: silence, model: model, languagePair: languagePair, mode: .source)
+            return true
+        } catch WhisperEngineError.emptyResult {
+            return true
+        } catch WhisperEngineError.timedOut {
+            return true
+        } catch {
+            return false
+        }
+    }
+
     private func request(
         audio chunk: PCMAudioChunk,
         model: InstalledModel,
         languagePair: LanguagePair,
         mode: HelperRequestMode
     ) async throws -> SpeechTranslationResult {
-        try await withCheckedThrowingContinuation { continuation in
+        let baseBudget = mode == .source ? draftTimeoutSeconds : finalTimeoutSeconds
+        let requestBudget = processState.hasRunningProcess ? baseBudget : baseBudget + coldStartExtraSeconds
+
+        return try await withCheckedThrowingContinuation { continuation in
             let resumeBox = ResumeBox<SpeechTranslationResult>()
-            let requestTimeoutSeconds = processState.hasRunningProcess ? warmTimeoutSeconds : coldStartTimeoutSeconds
             requestQueue.async {
+                self.processState.setWorkerBusy(true)
                 let result = Result {
                     try self.performRequest(audio: chunk, model: model, languagePair: languagePair, mode: mode)
                 }
+                self.processState.setWorkerBusy(false)
                 resumeBox.resume(continuation, with: result)
             }
 
-            DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + requestTimeoutSeconds) {
-                if resumeBox.resume(continuation, with: .failure(WhisperEngineError.timedOut(seconds: requestTimeoutSeconds))) {
+            DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + requestBudget) {
+                let didTimeout = resumeBox.resume(continuation, with: .failure(WhisperEngineError.timedOut(seconds: requestBudget)))
+                guard didTimeout else {
+                    return
+                }
+
+                // The caller has moved on, but the helper keeps the loaded
+                // model and finishes in the background; the next request
+                // drains the stale response. Only a genuine hang (no output
+                // progress at all) justifies killing the process.
+                if self.processState.isStalled(beyond: self.stallKillInterval) {
                     self.processState.terminate()
                     self.processState.clear()
                 }
@@ -352,13 +477,13 @@ public final class PersistentWhisperTranslationEngine: SpeechTranslationEngine, 
         languagePair: LanguagePair,
         mode: HelperRequestMode
     ) throws -> SpeechTranslationResult {
-        guard let helperURL = helperURL ?? locator.locate() else {
+        guard let helperURL = locator.locate() else {
             throw WhisperEngineError.executableNotFound
         }
 
         let handles = try ensureHelperProcess(helperURL: helperURL)
         requestCounter += 1
-        let requestID = "\(requestCounter)"
+        let requestID = requestCounter
         let modelPathData = Data(model.localURL.path.utf8)
         let audioData = chunk.samples.withUnsafeBufferPointer { buffer -> Data in
             guard let baseAddress = buffer.baseAddress else {
@@ -368,13 +493,18 @@ public final class PersistentWhisperTranslationEngine: SpeechTranslationEngine, 
         }
 
         let header = "REQ \(requestID) \(modelPathData.count) \(languagePair.spokenLanguageCode) \(chunk.sampleRate) \(chunk.samples.count) 768 1 \(mode.rawValue)\n"
-        try handles.input.write(contentsOf: Data(header.utf8))
-        try handles.input.write(contentsOf: modelPathData)
-        try handles.input.write(contentsOf: audioData)
+        do {
+            try handles.input.write(contentsOf: Data(header.utf8))
+            try handles.input.write(contentsOf: modelPathData)
+            try handles.input.write(contentsOf: audioData)
+        } catch {
+            restartHelper()
+            throw WhisperEngineError.failed(exitCode: -1, output: "Could not reach the local translator; restarting it.")
+        }
 
         let response = try readResponse(from: handles.output, requestID: requestID)
-        let text = sanitizeWhisperOutput(response.text)
-        let sourceText = response.sourceText.map(sanitizeWhisperOutput(_:))
+        let text = CaptionText.sanitizeWhisperOutput(response.text)
+        let sourceText = response.sourceText.map(CaptionText.sanitizeWhisperOutput(_:))
         guard !text.isEmpty else {
             throw WhisperEngineError.emptyResult
         }
@@ -418,16 +548,18 @@ public final class PersistentWhisperTranslationEngine: SpeechTranslationEngine, 
         process.standardOutput = outputPipe
         process.standardError = FileHandle.nullDevice
 
-        do {
-            try process.run()
-        } catch {
-            throw error
-        }
+        // A helper that dies mid-write must surface as a thrown error, not a
+        // SIGPIPE that terminates the whole app.
+        _ = fcntl(inputPipe.fileHandleForWriting.fileDescriptor, F_SETNOSIGPIPE, 1)
+        _ = fcntl(outputPipe.fileHandleForReading.fileDescriptor, F_SETNOSIGPIPE, 1)
+
+        try process.run()
 
         processState.lock.lock()
         processState.process = process
         processState.input = inputPipe.fileHandleForWriting
         processState.output = outputPipe.fileHandleForReading
+        processState.lastActivityAt = Date()
         let input = inputPipe.fileHandleForWriting
         let output = outputPipe.fileHandleForReading
         processState.lock.unlock()
@@ -435,40 +567,56 @@ public final class PersistentWhisperTranslationEngine: SpeechTranslationEngine, 
         return (input, output)
     }
 
-    private func readResponse(from output: FileHandle, requestID: String) throws -> (text: String, sourceText: String?, elapsedMs: Int) {
-        let line = try readLine(from: output)
-        let parts = line.split(separator: " ").map(String.init)
-        guard parts.count == 4 || parts.count == 5 else {
+    private func readResponse(from output: FileHandle, requestID: Int) throws -> (text: String, sourceText: String?, elapsedMs: Int) {
+        // Responses from abandoned (timed-out) requests are identified by
+        // their lower IDs and drained so the stream stays aligned.
+        while true {
+            let line = try readLine(from: output)
+            let parts = line.split(separator: " ").map(String.init)
+            guard parts.count == 4 || parts.count == 5,
+                  let responseID = Int(parts[1]),
+                  let byteCount = Int(parts[3]),
+                  byteCount >= 0
+            else {
+                restartHelper()
+                throw WhisperEngineError.failed(exitCode: -1, output: "Invalid persistent Whisper response.")
+            }
+
+            let sourceByteCount = parts.count == 5 ? (Int(parts[4]) ?? 0) : 0
+            guard sourceByteCount >= 0 else {
+                restartHelper()
+                throw WhisperEngineError.failed(exitCode: -1, output: "Invalid persistent Whisper response.")
+            }
+
+            let payload = try readData(from: output, byteCount: byteCount)
+            let sourcePayload = try readData(from: output, byteCount: sourceByteCount)
+            _ = try? readData(from: output, byteCount: 1)
+
+            if responseID < requestID {
+                continue
+            }
+
+            guard responseID == requestID else {
+                restartHelper()
+                throw WhisperEngineError.failed(exitCode: -1, output: "Mismatched persistent Whisper response.")
+            }
+
+            let status = parts[0]
+            let elapsedMs = Int(parts[2]) ?? 0
+            let text = String(data: payload, encoding: .utf8) ?? ""
+            let sourceText = sourceByteCount > 0 ? String(data: sourcePayload, encoding: .utf8) : nil
+
+            if status == "OK" || status == "OK2" {
+                return (text, sourceText, elapsedMs)
+            }
+
+            if status == "ERR", text.localizedCaseInsensitiveContains("no subtitle") {
+                throw WhisperEngineError.emptyResult
+            }
+
             restartHelper()
-            throw WhisperEngineError.failed(exitCode: -1, output: "Invalid persistent Whisper response.")
+            throw WhisperEngineError.failed(exitCode: -1, output: text)
         }
-
-        let status = parts[0]
-        let responseID = parts[1]
-        let elapsedMs = Int(parts[2]) ?? 0
-        let byteCount = Int(parts[3]) ?? 0
-        let sourceByteCount = parts.count == 5 ? (Int(parts[4]) ?? 0) : 0
-        guard responseID == requestID, byteCount >= 0, sourceByteCount >= 0 else {
-            restartHelper()
-            throw WhisperEngineError.failed(exitCode: -1, output: "Mismatched persistent Whisper response.")
-        }
-
-        let payload = try readData(from: output, byteCount: byteCount)
-        let sourcePayload = try readData(from: output, byteCount: sourceByteCount)
-        _ = try? readData(from: output, byteCount: 1)
-        let text = String(data: payload, encoding: .utf8) ?? ""
-        let sourceText = sourceByteCount > 0 ? String(data: sourcePayload, encoding: .utf8) : nil
-
-        if status == "OK" || status == "OK2" {
-            return (text, sourceText, elapsedMs)
-        }
-
-        if status == "ERR", text.localizedCaseInsensitiveContains("no subtitle") {
-            throw WhisperEngineError.emptyResult
-        }
-
-        restartHelper()
-        throw WhisperEngineError.failed(exitCode: -1, output: text)
     }
 
     private func readLine(from handle: FileHandle) throws -> String {
@@ -480,6 +628,7 @@ public final class PersistentWhisperTranslationEngine: SpeechTranslationEngine, 
                 throw WhisperEngineError.failed(exitCode: -1, output: "Persistent Whisper helper closed unexpectedly.")
             }
 
+            processState.noteActivity()
             if byte.first == UInt8(ascii: "\n") {
                 break
             }
@@ -497,6 +646,7 @@ public final class PersistentWhisperTranslationEngine: SpeechTranslationEngine, 
                 restartHelper()
                 throw WhisperEngineError.failed(exitCode: -1, output: "Persistent Whisper helper closed during response.")
             }
+            processState.noteActivity()
             data.append(chunk)
         }
         return data
@@ -506,29 +656,17 @@ public final class PersistentWhisperTranslationEngine: SpeechTranslationEngine, 
         processState.terminate()
         processState.clear()
     }
-
-    private func sanitizeWhisperOutput(_ output: String) -> String {
-        output
-            .components(separatedBy: .newlines)
-            .map { line in
-                line.replacingOccurrences(of: #"\[[^\]]+\]"#, with: "", options: .regularExpression)
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-            }
-            .filter { !$0.isEmpty }
-            .joined(separator: " ")
-            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-    }
 }
 
+/// One-shot whisper-cli engine, used only when the persistent helper binary
+/// is missing (development runs without packaging). Reloads the model on
+/// every request, so the timeout must cover a full model load.
 public final class WhisperCLITranslationEngine: SpeechTranslationEngine {
     private let locator: WhisperExecutableLocator
-    private let cachedExecutableURL: URL?
     private let timeoutSeconds: TimeInterval
 
-    public init(locator: WhisperExecutableLocator = .default, timeoutSeconds: TimeInterval = 5) {
+    public init(locator: WhisperExecutableLocator = .default, timeoutSeconds: TimeInterval = 30) {
         self.locator = locator
-        self.cachedExecutableURL = locator.locate()
         self.timeoutSeconds = timeoutSeconds
     }
 
@@ -561,7 +699,7 @@ public final class WhisperCLITranslationEngine: SpeechTranslationEngine {
         languagePair: LanguagePair,
         shouldTranslate: Bool
     ) async throws -> SpeechTranslationResult {
-        guard let executableURL = cachedExecutableURL ?? locator.locate() else {
+        guard let executableURL = locator.locate() else {
             throw WhisperEngineError.executableNotFound
         }
 
@@ -576,35 +714,17 @@ public final class WhisperCLITranslationEngine: SpeechTranslationEngine {
         let outputTextURL = tempDirectory.appendingPathComponent("caption.txt")
         try WaveFile.pcm16Data(from: chunk).write(to: audioURL, options: [.atomic])
 
-        let output: String
-        do {
-            output = try await runWhisper(
-                executableURL: executableURL,
-                modelURL: model.localURL,
-                audioURL: audioURL,
-                outputPrefix: outputPrefix,
-                languagePair: languagePair,
-                shouldTranslate: shouldTranslate,
-                disableGPU: false
-            )
-        } catch let error as WhisperEngineError {
-            guard case .failed = error else {
-                throw error
-            }
-
-            output = try await runWhisper(
-                executableURL: executableURL,
-                modelURL: model.localURL,
-                audioURL: audioURL,
-                outputPrefix: outputPrefix,
-                languagePair: languagePair,
-                shouldTranslate: shouldTranslate,
-                disableGPU: true
-            )
-        }
+        let output = try await runWhisper(
+            executableURL: executableURL,
+            modelURL: model.localURL,
+            audioURL: audioURL,
+            outputPrefix: outputPrefix,
+            languagePair: languagePair,
+            shouldTranslate: shouldTranslate
+        )
 
         let textFromFile = (try? String(contentsOf: outputTextURL, encoding: .utf8)) ?? ""
-        let text = sanitizeWhisperOutput(textFromFile.isEmpty ? output : textFromFile)
+        let text = CaptionText.sanitizeWhisperOutput(textFromFile.isEmpty ? output : textFromFile)
         guard !text.isEmpty else {
             throw WhisperEngineError.emptyResult
         }
@@ -623,8 +743,7 @@ public final class WhisperCLITranslationEngine: SpeechTranslationEngine {
         audioURL: URL,
         outputPrefix: URL,
         languagePair: LanguagePair,
-        shouldTranslate: Bool,
-        disableGPU: Bool
+        shouldTranslate: Bool
     ) async throws -> String {
         let timeoutSeconds = self.timeoutSeconds
         return try await withThrowingTaskGroup(of: String.self) { group in
@@ -635,8 +754,7 @@ public final class WhisperCLITranslationEngine: SpeechTranslationEngine {
                     audioURL: audioURL,
                     outputPrefix: outputPrefix,
                     languagePair: languagePair,
-                    shouldTranslate: shouldTranslate,
-                    disableGPU: disableGPU
+                    shouldTranslate: shouldTranslate
                 )
             }
 
@@ -659,8 +777,7 @@ public final class WhisperCLITranslationEngine: SpeechTranslationEngine {
         audioURL: URL,
         outputPrefix: URL,
         languagePair: LanguagePair,
-        shouldTranslate: Bool,
-        disableGPU: Bool
+        shouldTranslate: Bool
     ) async throws -> String {
         let processBox = ProcessBox()
         return try await withTaskCancellationHandler {
@@ -684,9 +801,6 @@ public final class WhisperCLITranslationEngine: SpeechTranslationEngine {
                 if shouldTranslate {
                     arguments.append("-tr")
                 }
-                if disableGPU {
-                    arguments.append("-ng")
-                }
                 process.arguments = arguments
 
                 let outputPipe = Pipe()
@@ -694,9 +808,15 @@ public final class WhisperCLITranslationEngine: SpeechTranslationEngine {
                 process.standardOutput = outputPipe
                 process.standardError = errorPipe
 
+                // Drain both pipes while the process runs; whisper-cli can
+                // emit more than a pipe buffer of logs, and an undrained pipe
+                // would block it forever.
+                let stdoutBuffer = PipeDrainBuffer(handle: outputPipe.fileHandleForReading)
+                let stderrBuffer = PipeDrainBuffer(handle: errorPipe.fileHandleForReading)
+
                 process.terminationHandler = { process in
-                    let stdout = String(data: outputPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-                    let stderr = String(data: errorPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+                    let stdout = stdoutBuffer.finish()
+                    let stderr = stderrBuffer.finish()
                     let combined = [stdout, stderr].filter { !$0.isEmpty }.joined(separator: "\n")
 
                     if process.terminationStatus == 0 {
@@ -716,18 +836,36 @@ public final class WhisperCLITranslationEngine: SpeechTranslationEngine {
             processBox.terminate()
         }
     }
+}
 
-    private func sanitizeWhisperOutput(_ output: String) -> String {
-        output
-            .components(separatedBy: .newlines)
-            .map { line in
-                line.replacingOccurrences(of: #"\[[^\]]+\]"#, with: "", options: .regularExpression)
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
+private final class PipeDrainBuffer: @unchecked Sendable {
+    private let lock = NSLock()
+    private var data = Data()
+    private let handle: FileHandle
+
+    init(handle: FileHandle) {
+        self.handle = handle
+        handle.readabilityHandler = { [weak self] handle in
+            let available = handle.availableData
+            guard let self, !available.isEmpty else {
+                return
             }
-            .filter { !$0.isEmpty }
-            .joined(separator: " ")
-            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+            self.lock.lock()
+            self.data.append(available)
+            self.lock.unlock()
+        }
+    }
+
+    func finish() -> String {
+        handle.readabilityHandler = nil
+        let remainder = (try? handle.readToEnd()) ?? Data()
+        lock.lock()
+        if !remainder.isEmpty {
+            data.append(remainder)
+        }
+        let snapshot = data
+        lock.unlock()
+        return String(data: snapshot, encoding: .utf8) ?? ""
     }
 }
 

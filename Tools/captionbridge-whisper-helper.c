@@ -113,6 +113,21 @@ static char * duplicate_bytes_as_string(const char * bytes, size_t length) {
     return value;
 }
 
+// True when the text contains at least one letter (ASCII or any UTF-8
+// multi-byte character). Whisper renders silence as "..." or stray
+// punctuation, which must not count as speech.
+static bool contains_letters(const char * text) {
+    if (text == NULL) {
+        return false;
+    }
+    for (const unsigned char * p = (const unsigned char *) text; *p != '\0'; p++) {
+        if (isalpha(*p) || *p >= 0x80) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static char * trimmed_copy(const char * text) {
     if (text == NULL) {
         return duplicate_bytes_as_string("", 0);
@@ -166,6 +181,7 @@ static bool ensure_model(const char * model_path, bool use_gpu, char ** error_me
 
     struct whisper_context_params context_params = whisper_context_default_params();
     context_params.use_gpu = use_gpu;
+    context_params.flash_attn = true;
     g_ctx = whisper_init_from_file_with_params(model_path, context_params);
 
     if (g_ctx == NULL && use_gpu) {
@@ -231,7 +247,7 @@ static char * run_whisper_samples(const float * samples, int sample_count, const
         }
 
         const float no_speech_prob = whisper_full_get_segment_no_speech_prob(g_ctx, index);
-        if (!translate && no_speech_prob > 0.72f) {
+        if (no_speech_prob > 0.72f) {
             free(segment);
             continue;
         }
@@ -352,6 +368,18 @@ int main(void) {
             free(error_message);
             error_message = NULL;
             source_text = duplicate_bytes_as_string("", 0);
+        }
+
+        // The source pass has reliable no-speech detection; if it heard no
+        // words there is nothing to translate, and skipping the translate
+        // pass avoids both the wasted compute and its hallucinations
+        // ("Thanks for watching!" on silence).
+        if (!contains_letters(source_text)) {
+            write_response("ERR", request_id, "Whisper produced no subtitle text", monotonic_ms() - start_ms);
+            free(source_text);
+            free(model_path_bytes);
+            free(samples);
+            continue;
         }
 
         char * text = run_whisper_samples(samples, sample_count, language, audio_ctx, true, true, &error_message);

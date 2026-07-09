@@ -189,7 +189,7 @@ final class LiveSubtitleCoordinatorTests: XCTestCase {
             emit: { events.append($0) }
         )
 
-        XCTAssertEqual(events.values.map(\.kind), [.speechStarted, .final])
+        XCTAssertEqual(events.values.map(\.kind), [.speechStarted, .sourceDraft, .final])
         XCTAssertEqual(events.values.last?.text, "We must finish the report before Friday.")
 
         let translatedChunks = await engine.chunks()
@@ -243,7 +243,7 @@ final class LiveSubtitleCoordinatorTests: XCTestCase {
             status: { statuses.append($0) }
         )
 
-        XCTAssertEqual(events.values.map(\.kind), [.speechStarted, .final])
+        XCTAssertEqual(events.values.map(\.kind), [.speechStarted, .sourceDraft, .final])
         XCTAssertEqual(events.values.last?.text, "We must finalize the report.")
 
         let translatedChunks = await engine.chunks()
@@ -386,6 +386,64 @@ final class LiveSubtitleCoordinatorTests: XCTestCase {
         let sourceDrafts = events.values.filter { $0.kind == .sourceDraft }.map(\.text)
         XCTAssertTrue(sourceDrafts.contains("Bonjour à tous merci"))
         XCTAssertFalse(events.values.contains { $0.text == "*musique*" })
+    }
+
+    func testFirstCredibleDraftIsEmittedImmediately() async {
+        let engine = SequencedSpeechTranslationEngine(
+            outcomes: [
+                .result(SpeechTranslationResult(text: "Bonjour à tous", isFinal: false))
+            ]
+        )
+        let coordinator = makeCoordinator(engine: engine)
+        let events = CaptionEventRecorder()
+        let model = testModel()
+
+        for index in 0..<7 {
+            await coordinator.handle(
+                chunk: chunk(amplitude: 0.05, index: index),
+                model: model,
+                languagePair: .frenchToEnglish,
+                emit: { events.append($0) }
+            )
+        }
+
+        XCTAssertEqual(Array(events.values.map(\.kind).prefix(2)), [.speechStarted, .sourceDraft])
+        XCTAssertEqual(events.values.first { $0.kind == .sourceDraft }?.text, "Bonjour à tous")
+    }
+
+    func testLowercaseContinuationDraftEmitsAfterForcedFinal() async {
+        let engine = SequencedSpeechTranslationEngine(
+            outcomes: [
+                .result(SpeechTranslationResult(text: "The team can finish the preparation", isFinal: true)),
+                .result(SpeechTranslationResult(text: "que nous devons terminer la préparation", isFinal: false))
+            ]
+        )
+        let coordinator = LiveSubtitleCoordinator(
+            engine: engine,
+            silenceGate: SilenceGate(rmsThreshold: 0.01, minimumSpeechDuration: 0.1),
+            sampleRate: sampleRate,
+            windowDuration: 0.5,
+            speechAnalysisDuration: 0.1,
+            minimumInferenceDuration: 0.25,
+            minimumProcessingInterval: 0,
+            maxUtteranceDuration: 0.5,
+            trailingSilenceDuration: 0.2,
+            maximumUtteranceDuration: 0.2
+        )
+        let events = CaptionEventRecorder()
+        let model = testModel()
+
+        for index in 0..<14 {
+            await coordinator.handle(
+                chunk: chunk(amplitude: 0.05, index: index),
+                model: model,
+                languagePair: .frenchToEnglish,
+                emit: { events.append($0) }
+            )
+        }
+
+        let sourceDrafts = events.values.filter { $0.kind == .sourceDraft }.map(\.text)
+        XCTAssertTrue(sourceDrafts.contains("que nous devons terminer la préparation"))
     }
 
     private func makeCoordinator(engine: any SpeechTranslationEngine) -> LiveSubtitleCoordinator {

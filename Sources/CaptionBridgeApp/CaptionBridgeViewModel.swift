@@ -2,6 +2,9 @@ import AppKit
 import CaptionBridgeCore
 import Foundation
 import SwiftUI
+#if canImport(Translation)
+import Translation
+#endif
 
 @MainActor
 final class CaptionBridgeViewModel: ObservableObject {
@@ -18,6 +21,20 @@ final class CaptionBridgeViewModel: ObservableObject {
             }
             return false
         }
+
+        var isActive: Bool {
+            switch self {
+            case .preparing, .running, .paused:
+                return true
+            case .idle, .failed:
+                return false
+            }
+        }
+    }
+
+    private enum CoordinatorSignal {
+        case event(CaptionEvent, epoch: Int)
+        case status(String, epoch: Int)
     }
 
     @Published var settings = AppSettings()
@@ -45,44 +62,93 @@ final class CaptionBridgeViewModel: ObservableObject {
     private let modelManager = ModelManager()
     private let systemCapture = SystemAudioCaptureService()
     private let microphoneCapture = MicrophoneCaptureService()
-    private let coordinator = LiveSubtitleCoordinator(engine: WhisperLiveTranslationEngine())
+    private let engine = WhisperLiveTranslationEngine()
+    private let coordinator: LiveSubtitleCoordinator
     private var installedModel: InstalledModel?
     private var activeCapture: (any AudioCaptureService)?
     private var modelDownloadTask: Task<Void, Never>?
     private var isPaused = false
     private var diagnosticLogURL: URL?
+    private var diagnosticHandle: FileHandle?
+    private var didConfigureLaunchDiagnostics = false
     private var receivedChunkCount = 0
-    private var captureSessionID = UUID()
+    private var sessionEpoch = 0
+    private var didAttemptCaptureRestart = false
     private var lastDiagnosticStatus: String?
     private var lastDiagnosticOverlayText: String?
-    private let sourceDraftPresentationDelay: TimeInterval = 0.12
-    private let minimumSourceDraftReplacementInterval: TimeInterval = 0.3
-    private let stableDraftPresentationDelay: TimeInterval = 0.5
-    private let unsettledDraftPresentationDelay: TimeInterval = 1.3
-    private let minimumDraftReplacementInterval: TimeInterval = 1.2
-    private var pendingSourceDraftTask: Task<Void, Never>?
-    private var pendingSourceDraftText: String?
-    private var sourceDraftPresentationGeneration = 0
-    private var lastSourceDraftPresentedAt: Date?
-    private var pendingDraftTask: Task<Void, Never>?
-    private var pendingDraftEvent: CaptionEvent?
-    private var draftPresentationGeneration = 0
-    private var lastDraftPresentedAt: Date?
-    private var previousRawDraftText: String?
     private var subtitleHistoryBuffer = SubtitleHistoryBuffer(maximumVisibleFinalCaptions: 3)
     private var sessionTranscriptBuffer = SubtitleHistoryBuffer(maximumVisibleFinalCaptions: 80)
 
+    // Audio chunks and caption events each flow through a single ordered
+    // stream: unstructured per-callback Tasks would not preserve order, and
+    // out-of-order audio garbles transcription.
+    private let chunkStream: AsyncStream<PCMAudioChunk>
+    private let chunkContinuation: AsyncStream<PCMAudioChunk>.Continuation
+    private let signalStream: AsyncStream<CoordinatorSignal>
+    private let signalContinuation: AsyncStream<CoordinatorSignal>.Continuation
+    private var pipelineTasks: [Task<Void, Never>] = []
+
+    // French drafts queued for on-device English translation (macOS 15+).
+    private var frenchDraftContinuation: AsyncStream<String>.Continuation?
+
+    private static let diagnosticTimestampFormatter = ISO8601DateFormatter()
+
     init() {
-        systemCapture.onChunk = { [weak self] chunk in
-            Task { await self?.handle(chunk: chunk) }
+        coordinator = LiveSubtitleCoordinator(engine: engine)
+        (chunkStream, chunkContinuation) = AsyncStream.makeStream(of: PCMAudioChunk.self)
+        (signalStream, signalContinuation) = AsyncStream.makeStream(of: CoordinatorSignal.self)
+
+        let chunkContinuation = chunkContinuation
+        systemCapture.onChunk = { chunk in
+            chunkContinuation.yield(chunk)
         }
-        microphoneCapture.onChunk = { [weak self] chunk in
-            Task { await self?.handle(chunk: chunk) }
+        microphoneCapture.onChunk = { chunk in
+            chunkContinuation.yield(chunk)
         }
+        systemCapture.onStopped = { [weak self] error in
+            Task { @MainActor in
+                self?.handleCaptureStopped(error)
+            }
+        }
+        microphoneCapture.onStopped = { [weak self] error in
+            Task { @MainActor in
+                self?.handleCaptureStopped(error)
+            }
+        }
+
+        pipelineTasks.append(Task { [weak self] in
+            guard let stream = self?.chunkStream else {
+                return
+            }
+            for await chunk in stream {
+                guard let self else {
+                    return
+                }
+                await self.processChunk(chunk)
+            }
+        })
+
+        pipelineTasks.append(Task { [weak self] in
+            guard let stream = self?.signalStream else {
+                return
+            }
+            for await signal in stream {
+                guard let self else {
+                    return
+                }
+                self.applySignal(signal)
+            }
+        })
 
         Task {
             await loadInitialState()
         }
+    }
+
+    deinit {
+        pipelineTasks.forEach { $0.cancel() }
+        chunkContinuation.finish()
+        signalContinuation.finish()
     }
 
     func loadInitialState() async {
@@ -112,6 +178,11 @@ final class CaptionBridgeViewModel: ObservableObject {
     }
 
     func configureLaunchDiagnosticsIfNeeded() {
+        guard !didConfigureLaunchDiagnostics else {
+            return
+        }
+        didConfigureLaunchDiagnostics = true
+
         let environment = ProcessInfo.processInfo.environment
 
         if let logPath = environment["CAPTIONBRIDGE_EVENT_LOG"], !logPath.isEmpty {
@@ -209,6 +280,9 @@ final class CaptionBridgeViewModel: ObservableObject {
                 modelDownloadProgress = nil
                 if error is CancellationError || (error as? URLError)?.code == .cancelled {
                     modelStatus = "Model download canceled"
+                } else if case ModelManagerError.checksumMismatch = error {
+                    modelStatus = "The downloaded model failed its safety check. Please download again."
+                    lastError = modelStatus
                 } else {
                     modelStatus = error.localizedDescription
                     lastError = error.localizedDescription
@@ -226,23 +300,23 @@ final class CaptionBridgeViewModel: ObservableObject {
     }
 
     func startSubtitles() {
-        guard !sessionState.isRunning else {
+        guard !sessionState.isActive else {
             return
         }
 
+        sessionState = .preparing
         Task {
-            sessionState = .preparing
             lastError = nil
             canOpenPrivacySettings = false
             receivedChunkCount = 0
-            captureSessionID = UUID()
-            let sessionID = captureSessionID
+            sessionEpoch += 1
+            didAttemptCaptureRestart = false
             updateLiveStatus("Preparing local captioning...")
             isPaused = false
 
             await refreshModelStatus()
             refreshHelperStatus()
-            guard installedModel != nil else {
+            guard let model = installedModel else {
                 sessionState = .failed("Download a local model before starting subtitles.")
                 updateLiveStatus("Model needed")
                 return
@@ -254,6 +328,19 @@ final class CaptionBridgeViewModel: ObservableObject {
                 return
             }
 
+            // Load the model before audio starts so the first sentence of the
+            // meeting doesn't pay the multi-second cold start.
+            updateLiveStatus("Loading the translation model into memory...")
+            let warmedUp = await engine.warmUp(model: model, languagePair: settings.languagePair)
+            if !warmedUp {
+                refreshHelperStatus()
+                guard isLocalTranslatorReady else {
+                    sessionState = .failed("Reinstall CaptionBridge from the DMG so the local translator is included.")
+                    updateLiveStatus("Local translator needed")
+                    return
+                }
+            }
+
             do {
                 let capture: any AudioCaptureService = settings.audioSource == .microphone ? microphoneCapture : systemCapture
                 activeCapture = capture
@@ -262,7 +349,7 @@ final class CaptionBridgeViewModel: ObservableObject {
                 isOverlayVisible = true
                 sessionState = .running
                 updateLiveStatus(listeningStatus)
-                scheduleNoAudioCheck(sessionID: sessionID)
+                scheduleNoAudioCheck(epoch: sessionEpoch)
             } catch {
                 let message = friendlyMessage(for: error)
                 sessionState = .failed(message)
@@ -279,9 +366,17 @@ final class CaptionBridgeViewModel: ObservableObject {
         case .running:
             isPaused = true
             sessionState = .paused
+            draftSubtitle = ""
+            draftSourceText = nil
         case .paused:
             isPaused = false
             sessionState = .running
+            // Drop audio buffered before the pause so a stale half-sentence
+            // is not finalized minutes later.
+            Task {
+                await coordinator.resetSpeechTracking()
+            }
+            updateLiveStatus(listeningStatus)
         default:
             break
         }
@@ -289,36 +384,28 @@ final class CaptionBridgeViewModel: ObservableObject {
 
     func stopSubtitles() {
         Task {
+            sessionEpoch += 1
             await activeCapture?.stop()
             activeCapture = nil
             isPaused = false
             sessionState = .idle
             canOpenPrivacySettings = false
-            captureSessionID = UUID()
             updateLiveStatus("Idle")
-            resetActiveCaptionsAfterStop()
+            draftSubtitle = ""
+            draftSourceText = nil
+            recordOverlayDisplayIfChanged()
+            await coordinator.resetSpeechTracking()
         }
     }
 
     func clearCaptions() {
-        resetDraftPresentationState()
-        currentSubtitle = ""
-        currentSourceText = nil
-        draftSubtitle = ""
-        draftSourceText = nil
-        subtitleHistoryBuffer.clear()
-        subtitleHistory = subtitleHistoryBuffer.items
-        sessionTranscriptBuffer.clear()
-        sessionTranscript = sessionTranscriptBuffer.items
-        recordOverlayDisplayIfChanged()
+        let epoch = sessionEpoch
         if sessionState.isRunning {
             updateLiveStatus(listeningStatus)
         }
         Task {
-            await coordinator.clear { [weak self] event in
-                Task { @MainActor in
-                    self?.apply(event: event)
-                }
+            await coordinator.clear { [signalContinuation] event in
+                signalContinuation.yield(.event(event, epoch: epoch))
             }
         }
     }
@@ -342,34 +429,30 @@ final class CaptionBridgeViewModel: ObservableObject {
         }
     }
 
-    private func handle(chunk: PCMAudioChunk) async {
+    private func processChunk(_ chunk: PCMAudioChunk) async {
         guard !isPaused, sessionState.isRunning else {
             return
         }
 
         guard !chunk.samples.isEmpty else {
-            updateLiveStatus("No readable system audio yet")
             return
         }
 
         receivedChunkCount += 1
-        if receivedChunkCount == 1 || receivedChunkCount.isMultiple(of: 25) {
+        if diagnosticLogURL != nil, receivedChunkCount == 1 || receivedChunkCount.isMultiple(of: 25) {
             let rms = AudioProcessing.rms(chunk.samples)
             recordDiagnostic("audio chunk \(receivedChunkCount): samples=\(chunk.samples.count) rms=\(rms)")
         }
 
+        let epoch = sessionEpoch
         await coordinator.handle(
             chunk: chunk,
             model: installedModel,
             languagePair: settings.languagePair
-        ) { [weak self] event in
-            Task { @MainActor in
-                self?.apply(event: event)
-            }
-        } status: { [weak self] message in
-            Task { @MainActor in
-                self?.updateLiveStatus(message)
-            }
+        ) { [signalContinuation] event in
+            signalContinuation.yield(.event(event, epoch: epoch))
+        } status: { [signalContinuation] message in
+            signalContinuation.yield(.status(message, epoch: epoch))
         }
     }
 
@@ -377,14 +460,33 @@ final class CaptionBridgeViewModel: ObservableObject {
         isSelectedModelInstalled && isLocalTranslatorReady && modelDownloadProgress == nil
     }
 
+    var supportsInstantEnglishDrafts: Bool {
+        if #available(macOS 15.0, *) {
+            return true
+        }
+        return false
+    }
+
+    private func applySignal(_ signal: CoordinatorSignal) {
+        switch signal {
+        case let .event(event, epoch):
+            guard epoch == sessionEpoch else {
+                return
+            }
+            apply(event: event)
+        case let .status(message, epoch):
+            guard epoch == sessionEpoch else {
+                return
+            }
+            updateLiveStatus(message)
+        }
+    }
+
     private func apply(event: CaptionEvent) {
         switch event.kind {
         case .sourceDraft:
             presentSourceDraft(event.text)
-        case .draft:
-            scheduleDraftPresentation(for: event)
         case .final:
-            resetDraftPresentationState()
             appendFinalCaption(event)
             currentSourceText = event.sourceText
             draftSubtitle = ""
@@ -392,14 +494,12 @@ final class CaptionBridgeViewModel: ObservableObject {
             recordDiagnostic("final: \(event.text)")
             updateLiveStatus("Caption updated")
         case .speechStarted:
-            resetDraftPresentationState()
             currentSourceText = nil
             draftSubtitle = ""
             draftSourceText = nil
             recordDiagnostic("speech started")
             updateLiveStatus("Listening to the next sentence...")
         case .cleared:
-            resetDraftPresentationState()
             currentSubtitle = ""
             currentSourceText = nil
             draftSubtitle = ""
@@ -410,7 +510,6 @@ final class CaptionBridgeViewModel: ObservableObject {
             sessionTranscript = sessionTranscriptBuffer.items
             recordDiagnostic("captions cleared")
         case .error:
-            resetDraftPresentationState()
             lastError = event.text
             recordDiagnostic("error: \(event.text)")
             updateLiveStatus("Needs attention")
@@ -428,184 +527,69 @@ final class CaptionBridgeViewModel: ObservableObject {
         sessionTranscript = sessionTranscriptBuffer.appendFinal(event)
     }
 
-    private func resetActiveCaptionsAfterStop() {
-        resetDraftPresentationState()
-        draftSubtitle = ""
-        draftSourceText = nil
-        recordOverlayDisplayIfChanged()
-        Task {
-            await coordinator.clear { _ in }
-        }
-    }
-
-    private func scheduleDraftPresentation(for event: CaptionEvent) {
-        let draftLooksStable = previousRawDraftText.map {
-            isLikelyStableDraft(previous: $0, candidate: event.text)
-        } ?? false
-        previousRawDraftText = event.text
-        pendingDraftEvent = event
-
-        guard pendingDraftTask == nil else {
-            return
-        }
-
-        draftPresentationGeneration += 1
-        let generation = draftPresentationGeneration
-        let delay = draftDelayNanoseconds(from: Date(), draftLooksStable: draftLooksStable)
-
-        pendingDraftTask = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: delay)
-            guard !Task.isCancelled else {
-                return
-            }
-
-            await MainActor.run {
-                guard let self,
-                      !Task.isCancelled,
-                      self.draftPresentationGeneration == generation
-                else {
-                    return
-                }
-
-                guard let event = self.pendingDraftEvent else {
-                    self.pendingDraftTask = nil
-                    return
-                }
-
-                self.pendingDraftTask = nil
-                self.pendingDraftEvent = nil
-                self.draftSubtitle = event.text
-                self.draftSourceText = event.sourceText
-                self.lastDraftPresentedAt = Date()
-                self.recordDiagnostic("draft: \(event.text)")
-                self.updateLiveStatus("Caption draft ready")
-            }
-        }
-    }
-
     private func presentSourceDraft(_ text: String) {
-        let normalized = text
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+        let normalized = CaptionText.collapseWhitespace(text)
         guard !normalized.isEmpty else {
             return
         }
 
-        pendingSourceDraftText = normalized
-        guard pendingSourceDraftTask == nil else {
+        draftSourceText = normalized
+        recordDiagnostic("source draft: \(normalized)")
+        updateLiveStatus("French caption ready")
+
+        if supportsInstantEnglishDrafts, settings.instantEnglishDraftsEnabled {
+            frenchDraftContinuation?.yield(normalized)
+        }
+    }
+
+    private func handleCaptureStopped(_ error: Error?) {
+        guard sessionState.isRunning || sessionState == .paused else {
             return
         }
 
-        sourceDraftPresentationGeneration += 1
-        let generation = sourceDraftPresentationGeneration
-        let replacementDelay = lastSourceDraftPresentedAt.map {
-            max(0, minimumSourceDraftReplacementInterval - Date().timeIntervalSince($0))
-        } ?? 0
-        let delay = UInt64(max(sourceDraftPresentationDelay, replacementDelay) * 1_000_000_000)
+        recordDiagnostic("capture stopped: \(error?.localizedDescription ?? "unknown")")
 
-        pendingSourceDraftTask = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: delay)
-            guard !Task.isCancelled else {
+        guard !didAttemptCaptureRestart, let capture = activeCapture else {
+            let message = error.map(friendlyMessage(for:)) ?? "Audio capture stopped unexpectedly."
+            sessionState = .failed(message)
+            lastError = message
+            canOpenPrivacySettings = error.map(isPrivacyPermissionError) ?? false
+            updateLiveStatus("Needs attention")
+            return
+        }
+
+        didAttemptCaptureRestart = true
+        updateLiveStatus("Audio capture interrupted. Reconnecting...")
+        Task {
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            guard sessionState.isRunning || sessionState == .paused else {
                 return
             }
-
-            await MainActor.run {
-                guard let self,
-                      !Task.isCancelled,
-                      self.sourceDraftPresentationGeneration == generation
-                else {
-                    return
-                }
-
-                guard let text = self.pendingSourceDraftText else {
-                    self.pendingSourceDraftTask = nil
-                    return
-                }
-
-                self.pendingSourceDraftTask = nil
-                self.pendingSourceDraftText = nil
-                self.draftSourceText = text
-                self.lastSourceDraftPresentedAt = Date()
-                self.recordDiagnostic("source draft: \(text)")
-                self.updateLiveStatus("French caption ready")
+            do {
+                try await capture.start(source: settings.audioSource)
+                updateLiveStatus(listeningStatus)
+                recordDiagnostic("capture restarted")
+            } catch {
+                let message = friendlyMessage(for: error)
+                sessionState = .failed(message)
+                lastError = message
+                canOpenPrivacySettings = isPrivacyPermissionError(error)
+                updateLiveStatus("Needs attention")
             }
         }
-    }
-
-    private func draftDelayNanoseconds(from date: Date, draftLooksStable: Bool) -> UInt64 {
-        let baseDelay = draftLooksStable ? stableDraftPresentationDelay : unsettledDraftPresentationDelay
-        let replacementDelay = lastDraftPresentedAt.map {
-            max(0, minimumDraftReplacementInterval - date.timeIntervalSince($0))
-        } ?? 0
-
-        let delay = max(baseDelay, replacementDelay)
-        return UInt64(delay * 1_000_000_000)
-    }
-
-    private func isLikelyStableDraft(previous: String, candidate: String) -> Bool {
-        let previousWords = normalizedWords(in: previous)
-        let candidateWords = normalizedWords(in: candidate)
-
-        guard previousWords.count >= 3, candidateWords.count >= 3 else {
-            return false
-        }
-
-        let shortestCount = min(previousWords.count, candidateWords.count)
-        let sharedPrefixCount = zip(previousWords, candidateWords)
-            .prefix { pair in pair.0 == pair.1 }
-            .count
-        let sharedPrefixRatio = Double(sharedPrefixCount) / Double(shortestCount)
-        if sharedPrefixRatio >= 0.8 {
-            return true
-        }
-
-        let previousSet = Set(previousWords)
-        let candidateSet = Set(candidateWords)
-        let sharedWordCount = previousSet.intersection(candidateSet).count
-        let sharedWordRatio = Double(sharedWordCount) / Double(min(previousSet.count, candidateSet.count))
-
-        return sharedWordRatio >= 0.85
-    }
-
-    private func normalizedWords(in text: String) -> [String] {
-        text.lowercased()
-            .components(separatedBy: CharacterSet.alphanumerics.inverted)
-            .filter { !$0.isEmpty }
-    }
-
-    private func resetDraftPresentationState() {
-        cancelPendingDraftPresentation()
-        cancelPendingSourceDraftPresentation()
-        lastDraftPresentedAt = nil
-        previousRawDraftText = nil
-        lastSourceDraftPresentedAt = nil
-    }
-
-    private func cancelPendingDraftPresentation() {
-        draftPresentationGeneration += 1
-        pendingDraftEvent = nil
-        pendingDraftTask?.cancel()
-        pendingDraftTask = nil
-    }
-
-    private func cancelPendingSourceDraftPresentation() {
-        sourceDraftPresentationGeneration += 1
-        pendingSourceDraftText = nil
-        pendingSourceDraftTask?.cancel()
-        pendingSourceDraftTask = nil
     }
 
     private var listeningStatus: String {
         settings.audioSource == .microphone ? "Listening for microphone audio..." : "Listening for system audio..."
     }
 
-    private func scheduleNoAudioCheck(sessionID: UUID) {
+    private func scheduleNoAudioCheck(epoch: Int) {
         Task { [weak self] in
             try? await Task.sleep(nanoseconds: 3_000_000_000)
 
             await MainActor.run {
                 guard let self,
-                      self.captureSessionID == sessionID,
+                      self.sessionEpoch == epoch,
                       self.sessionState.isRunning,
                       self.receivedChunkCount == 0
                 else {
@@ -618,6 +602,10 @@ final class CaptionBridgeViewModel: ObservableObject {
     }
 
     private func updateLiveStatus(_ message: String) {
+        guard liveStatus != message else {
+            return
+        }
+
         liveStatus = message
         if lastDiagnosticStatus != message {
             lastDiagnosticStatus = message
@@ -657,8 +645,10 @@ final class CaptionBridgeViewModel: ObservableObject {
                let draftSourceText,
                !draftSourceText.isEmpty {
                 visibleText.append(draftSubtitle.isEmpty ? draftSourceText : "\(draftSourceText) / \(draftSubtitle)")
-            } else {
+            } else if !draftSubtitle.isEmpty {
                 visibleText.append(draftSubtitle)
+            } else if let draftSourceText {
+                visibleText.append(draftSourceText)
             }
         }
 
@@ -678,18 +668,18 @@ final class CaptionBridgeViewModel: ObservableObject {
             return
         }
 
-        let timestamp = ISO8601DateFormatter().string(from: Date())
-        let line = "\(timestamp) \(message)\n"
-        let data = Data(line.utf8)
+        let timestamp = Self.diagnosticTimestampFormatter.string(from: Date())
+        let data = Data("\(timestamp) \(message)\n".utf8)
 
-        if FileManager.default.fileExists(atPath: diagnosticLogURL.path),
-           let handle = try? FileHandle(forWritingTo: diagnosticLogURL) {
-            defer { try? handle.close() }
-            _ = try? handle.seekToEnd()
-            _ = try? handle.write(contentsOf: data)
-        } else {
-            try? data.write(to: diagnosticLogURL, options: [.atomic])
+        if diagnosticHandle == nil {
+            if !FileManager.default.fileExists(atPath: diagnosticLogURL.path) {
+                FileManager.default.createFile(atPath: diagnosticLogURL.path, contents: nil)
+            }
+            diagnosticHandle = try? FileHandle(forWritingTo: diagnosticLogURL)
+            _ = try? diagnosticHandle?.seekToEnd()
         }
+
+        _ = try? diagnosticHandle?.write(contentsOf: data)
     }
 
     private func friendlyMessage(for error: Error) -> String {
@@ -704,17 +694,47 @@ final class CaptionBridgeViewModel: ObservableObject {
     }
 
     private func isPrivacyPermissionError(_ error: Error) -> Bool {
-        let rawMessage = error.localizedDescription
-        let lowercased = rawMessage.lowercased()
-
-        if lowercased.contains("tcc")
-            || lowercased.contains("declined")
-            || lowercased.contains("screen")
-            || lowercased.contains("microphone")
-            || lowercased.contains("capture") {
-            return true
+        if let captureError = error as? AudioCaptureError {
+            switch captureError {
+            case .screenCapturePermissionDenied, .microphonePermissionDenied:
+                return true
+            case .noDisplayAvailable, .teamsNotRunning, .sampleBufferMissingAudio, .unsupportedFormat, .microphoneUnavailable:
+                return false
+            }
         }
 
-        return false
+        // ScreenCaptureKit errors surface TCC denials with these markers.
+        let lowercased = error.localizedDescription.lowercased()
+        return lowercased.contains("tcc") || lowercased.contains("declined") || lowercased.contains("not permitted")
     }
 }
+
+#if canImport(Translation)
+@available(macOS 15.0, *)
+extension CaptionBridgeViewModel {
+    /// Long-running loop owned by the overlay's translationTask: receives
+    /// French drafts and publishes on-device English translations so the
+    /// English line updates while the speaker is still mid-sentence.
+    func runInstantDraftTranslation(session: TranslationSession) async {
+        frenchDraftContinuation?.finish()
+        let (stream, continuation) = AsyncStream.makeStream(of: String.self, bufferingPolicy: .bufferingNewest(1))
+        frenchDraftContinuation = continuation
+
+        // Downloads the French->English language pack the first time (one
+        // system prompt); afterwards it is a no-op and fully offline.
+        try? await session.prepareTranslation()
+
+        for await french in stream {
+            guard settings.instantEnglishDraftsEnabled else {
+                continue
+            }
+            guard let response = try? await session.translate(french) else {
+                continue
+            }
+            if draftSourceText == french {
+                draftSubtitle = response.targetText
+            }
+        }
+    }
+}
+#endif

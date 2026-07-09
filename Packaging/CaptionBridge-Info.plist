@@ -4,31 +4,33 @@
 <dict>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>en</string>
+	<key>CFBundleDisplayName</key>
+	<string>CaptionBridge</string>
 	<key>CFBundleExecutable</key>
 	<string>CaptionBridge</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
 	<key>CFBundleIdentifier</key>
 	<string>com.captionbridge.mac</string>
 	<key>CFBundleName</key>
 	<string>CaptionBridge</string>
-	<key>CFBundleDisplayName</key>
-	<string>CaptionBridge</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.1.0</string>
+	<string>0.2.0</string>
 	<key>CFBundleVersion</key>
-	<string>1</string>
+	<string>2</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>14.0</string>
+	<key>NSAudioCaptureUsageDescription</key>
+	<string>CaptionBridge uses local system audio capture to translate meeting audio on this Mac without cloud upload or recording.</string>
 	<key>NSHumanReadableCopyright</key>
 	<string>Copyright © 2026 CaptionBridge.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>CaptionBridge can listen to your microphone locally when you choose Microphone as the input source.</string>
-	<key>NSAudioCaptureUsageDescription</key>
-	<string>CaptionBridge uses local system audio capture to translate meeting audio on this Mac without cloud upload or recording.</string>
-	<key>NSScreenCaptureUsageDescription</key>
-	<string>CaptionBridge uses local screen and system audio capture so it can subtitle meeting audio without a bot or cloud upload.</string>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
+	<key>NSScreenCaptureUsageDescription</key>
+	<string>CaptionBridge uses local screen and system audio capture so it can subtitle meeting audio without a bot or cloud upload.</string>
 </dict>
 </plist>

@@ -6,6 +6,7 @@ public struct AppSettings: Codable, Equatable, Sendable {
     public var privacyMode: PrivacyMode
     public var subtitleDisplayMode: SubtitleDisplayMode
     public var subtitleOverlaySize: SubtitleOverlaySize
+    public var instantEnglishDraftsEnabled: Bool
     public var selectedModelID: String
     public var transcriptEnabled: Bool
     public var analyticsEnabled: Bool
@@ -19,6 +20,7 @@ public struct AppSettings: Codable, Equatable, Sendable {
         privacyMode: PrivacyMode = .onDeviceOnly,
         subtitleDisplayMode: SubtitleDisplayMode = .bilingual,
         subtitleOverlaySize: SubtitleOverlaySize = .compact,
+        instantEnglishDraftsEnabled: Bool = true,
         selectedModelID: String = ModelDescriptor.defaultModelID,
         transcriptEnabled: Bool = false,
         analyticsEnabled: Bool = false,
@@ -31,6 +33,7 @@ public struct AppSettings: Codable, Equatable, Sendable {
         self.privacyMode = privacyMode
         self.subtitleDisplayMode = subtitleDisplayMode
         self.subtitleOverlaySize = subtitleOverlaySize
+        self.instantEnglishDraftsEnabled = instantEnglishDraftsEnabled
         self.selectedModelID = selectedModelID
         self.transcriptEnabled = transcriptEnabled
         self.analyticsEnabled = analyticsEnabled
@@ -45,6 +48,7 @@ public struct AppSettings: Codable, Equatable, Sendable {
         case privacyMode
         case subtitleDisplayMode
         case subtitleOverlaySize
+        case instantEnglishDraftsEnabled
         case selectedModelID
         case transcriptEnabled
         case analyticsEnabled
@@ -60,6 +64,7 @@ public struct AppSettings: Codable, Equatable, Sendable {
         self.privacyMode = try values.decodeIfPresent(PrivacyMode.self, forKey: .privacyMode) ?? .onDeviceOnly
         self.subtitleDisplayMode = try values.decodeIfPresent(SubtitleDisplayMode.self, forKey: .subtitleDisplayMode) ?? .bilingual
         self.subtitleOverlaySize = try values.decodeIfPresent(SubtitleOverlaySize.self, forKey: .subtitleOverlaySize) ?? .compact
+        self.instantEnglishDraftsEnabled = try values.decodeIfPresent(Bool.self, forKey: .instantEnglishDraftsEnabled) ?? true
         self.selectedModelID = Self.canonicalModelID(try values.decodeIfPresent(String.self, forKey: .selectedModelID) ?? ModelDescriptor.defaultModelID)
         self.transcriptEnabled = try values.decodeIfPresent(Bool.self, forKey: .transcriptEnabled) ?? false
         self.analyticsEnabled = try values.decodeIfPresent(Bool.self, forKey: .analyticsEnabled) ?? false

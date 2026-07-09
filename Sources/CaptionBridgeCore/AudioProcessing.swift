@@ -1,114 +1,130 @@
+import Accelerate
 import Foundation
 
 public enum AudioProcessing {
-    public static func downmixToMono(interleaved samples: [Float], channelCount: Int) -> [Float] {
-        guard channelCount > 1 else {
-            return samples
-        }
-        guard channelCount > 0 else {
-            return []
-        }
-
-        let frameCount = samples.count / channelCount
-        return (0..<frameCount).map { frameIndex in
-            let start = frameIndex * channelCount
-            let frame = samples[start..<(start + channelCount)]
-            return frame.reduce(0, +) / Float(channelCount)
-        }
-    }
-
-    public static func resampleLinear(samples: [Float], from sourceRate: Int, to targetRate: Int) -> [Float] {
-        guard sourceRate > 0, targetRate > 0, !samples.isEmpty else {
-            return []
-        }
-
-        guard sourceRate != targetRate else {
-            return samples
-        }
-
-        let duration = Double(samples.count) / Double(sourceRate)
-        let outputCount = max(1, Int((duration * Double(targetRate)).rounded()))
-        let ratio = Double(sourceRate) / Double(targetRate)
-
-        return (0..<outputCount).map { outputIndex in
-            let sourcePosition = Double(outputIndex) * ratio
-            let lower = Int(sourcePosition.rounded(.down))
-            let upper = min(lower + 1, samples.count - 1)
-            let fraction = Float(sourcePosition - Double(lower))
-            let lowerValue = samples[min(lower, samples.count - 1)]
-            let upperValue = samples[upper]
-            return lowerValue + (upperValue - lowerValue) * fraction
-        }
-    }
-
-    public static func normalizeToWhisperRange(_ samples: [Float]) -> [Float] {
-        samples.map { sample in
-            min(1, max(-1, sample))
-        }
-    }
-
     public static func rms(_ samples: [Float]) -> Float {
         guard !samples.isEmpty else {
             return 0
         }
 
-        let sumSquares = samples.reduce(Float(0)) { partial, sample in
-            partial + sample * sample
-        }
-        return sqrt(sumSquares / Float(samples.count))
+        var value: Float = 0
+        vDSP_rmsqv(samples, 1, &value, vDSP_Length(samples.count))
+        return value
     }
 }
 
+/// Fixed-capacity circular buffer of audio samples. Appending past capacity
+/// drops the oldest samples without shifting memory, so per-chunk cost stays
+/// O(chunk) instead of O(capacity).
 public final class FloatRingBuffer {
     private let capacity: Int
-    private var storage: [Float] = []
+    private var storage: [Float]
+    private var head = 0
+    private(set) public var count = 0
 
     public init(capacity: Int) {
         self.capacity = max(1, capacity)
+        self.storage = [Float](repeating: 0, count: self.capacity)
     }
 
-    public var count: Int {
-        storage.count
-    }
-
+    /// Appends samples, dropping the oldest if capacity is exceeded.
+    /// Returns how many stored samples were dropped to make room.
     @discardableResult
     public func append(_ samples: [Float]) -> Int {
         guard !samples.isEmpty else {
             return 0
         }
 
-        storage.append(contentsOf: samples)
-        let droppedCount = max(0, storage.count - capacity)
-        if droppedCount > 0 {
-            storage.removeFirst(droppedCount)
+        // If the incoming block alone exceeds capacity, only its tail survives.
+        let incoming = samples.count > capacity ? Array(samples.suffix(capacity)) : samples
+        let skipped = samples.count - incoming.count
+
+        let overflow = max(0, count + incoming.count - capacity)
+        if overflow > 0 {
+            head = (head + overflow) % capacity
+            count -= overflow
         }
 
-        return droppedCount
+        var writeIndex = (head + count) % capacity
+        incoming.withUnsafeBufferPointer { source in
+            var copied = 0
+            while copied < incoming.count {
+                let run = min(incoming.count - copied, capacity - writeIndex)
+                storage.withUnsafeMutableBufferPointer { destination in
+                    destination.baseAddress!.advanced(by: writeIndex)
+                        .update(from: source.baseAddress!.advanced(by: copied), count: run)
+                }
+                copied += run
+                writeIndex = (writeIndex + run) % capacity
+            }
+        }
+        count += incoming.count
+
+        return overflow + skipped
     }
 
-    public func removeFirst(_ count: Int) {
-        guard count > 0 else {
+    public func removeFirst(_ removeCount: Int) {
+        guard removeCount > 0 else {
             return
         }
 
-        storage.removeFirst(min(count, storage.count))
+        let removable = min(removeCount, count)
+        head = (head + removable) % capacity
+        count -= removable
     }
 
-    public func suffix(_ count: Int) -> [Float] {
-        guard count > 0 else {
+    public func suffix(_ suffixCount: Int) -> [Float] {
+        guard suffixCount > 0, count > 0 else {
             return []
         }
 
-        return Array(storage.suffix(count))
+        let resultCount = min(suffixCount, count)
+        var result = [Float](repeating: 0, count: resultCount)
+        let start = (head + count - resultCount) % capacity
+        let firstRun = min(resultCount, capacity - start)
+        result.withUnsafeMutableBufferPointer { destination in
+            storage.withUnsafeBufferPointer { source in
+                destination.baseAddress!.update(from: source.baseAddress!.advanced(by: start), count: firstRun)
+                if firstRun < resultCount {
+                    destination.baseAddress!.advanced(by: firstRun)
+                        .update(from: source.baseAddress!, count: resultCount - firstRun)
+                }
+            }
+        }
+        return result
+    }
+
+    /// RMS over the most recent `suffixCount` samples without copying them out.
+    public func suffixRMS(_ suffixCount: Int) -> Float {
+        guard suffixCount > 0, count > 0 else {
+            return 0
+        }
+
+        let sampleCount = min(suffixCount, count)
+        let start = (head + count - sampleCount) % capacity
+        let firstRun = min(sampleCount, capacity - start)
+        var sumOfSquares: Float = 0
+        storage.withUnsafeBufferPointer { source in
+            var partial: Float = 0
+            vDSP_svesq(source.baseAddress!.advanced(by: start), 1, &partial, vDSP_Length(firstRun))
+            sumOfSquares += partial
+            if firstRun < sampleCount {
+                vDSP_svesq(source.baseAddress!, 1, &partial, vDSP_Length(sampleCount - firstRun))
+                sumOfSquares += partial
+            }
+        }
+        return sqrt(sumOfSquares / Float(sampleCount))
     }
 
     public func drain() -> [Float] {
-        defer { storage.removeAll(keepingCapacity: true) }
-        return storage
+        let all = suffix(count)
+        removeAll()
+        return all
     }
 
     public func removeAll() {
-        storage.removeAll(keepingCapacity: true)
+        head = 0
+        count = 0
     }
 }
 
@@ -123,5 +139,9 @@ public struct SilenceGate: Equatable, Sendable {
 
     public func isSpeech(_ chunk: PCMAudioChunk) -> Bool {
         chunk.duration >= minimumSpeechDuration && AudioProcessing.rms(chunk.samples) >= rmsThreshold
+    }
+
+    public func isSpeech(rms: Float, duration: TimeInterval) -> Bool {
+        duration >= minimumSpeechDuration && rms >= rmsThreshold
     }
 }

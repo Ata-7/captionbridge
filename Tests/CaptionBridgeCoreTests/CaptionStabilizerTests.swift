@@ -2,45 +2,52 @@ import XCTest
 @testable import CaptionBridgeCore
 
 final class CaptionStabilizerTests: XCTestCase {
-    func testDraftsOnlyEmitWhenTextChanges() {
+    func testFinalIsEmittedAndNormalized() {
         var stabilizer = CaptionStabilizer()
 
-        let first = stabilizer.ingest(CaptionCandidate(text: " We need ", isFinal: false))
-        let duplicate = stabilizer.ingest(CaptionCandidate(text: "We need", isFinal: false))
-        let changed = stabilizer.ingest(CaptionCandidate(text: "We need the report", isFinal: false))
+        let final = stabilizer.ingest(CaptionCandidate(text: "  We need   the report. ", isFinal: true))
 
-        XCTAssertEqual(first?.kind, .draft)
+        XCTAssertEqual(final?.kind, .final)
+        XCTAssertEqual(final?.text, "We need the report.")
+    }
+
+    func testDuplicateFinalWithinWindowIsSuppressed() {
+        var stabilizer = CaptionStabilizer(duplicateSuppressionWindow: 5)
+        let now = Date()
+
+        let first = stabilizer.ingest(CaptionCandidate(text: "Merci.", isFinal: true), at: now)
+        let duplicate = stabilizer.ingest(CaptionCandidate(text: "Merci.", isFinal: true), at: now.addingTimeInterval(1))
+
+        XCTAssertNotNil(first)
         XCTAssertNil(duplicate)
-        XCTAssertEqual(changed?.text, "We need the report")
     }
 
-    func testFinalClearsDraftAndSuppressesDuplicateFinal() {
-        var stabilizer = CaptionStabilizer()
+    func testRepeatedSentenceAfterWindowIsShownAgain() {
+        var stabilizer = CaptionStabilizer(duplicateSuppressionWindow: 5)
+        let now = Date()
 
-        _ = stabilizer.ingest(CaptionCandidate(text: "We need", isFinal: false))
-        let final = stabilizer.ingest(CaptionCandidate(text: "We need the report.", isFinal: true))
-        let duplicateFinal = stabilizer.ingest(CaptionCandidate(text: "We need the report.", isFinal: true))
-        let newDraft = stabilizer.ingest(CaptionCandidate(text: "Before Friday", isFinal: false))
+        let first = stabilizer.ingest(CaptionCandidate(text: "Merci.", isFinal: true), at: now)
+        let laterRepeat = stabilizer.ingest(CaptionCandidate(text: "Merci.", isFinal: true), at: now.addingTimeInterval(30))
 
-        XCTAssertEqual(final?.kind, .final)
-        XCTAssertNil(duplicateFinal)
-        XCTAssertEqual(newDraft?.kind, .draft)
+        XCTAssertNotNil(first)
+        XCTAssertNotNil(laterRepeat)
+        XCTAssertEqual(laterRepeat?.text, "Merci.")
     }
 
-    func testFinalPrefersRecentDraftOverShortOverlappingFragment() {
+    func testNonFinalCandidatesAreIgnored() {
         var stabilizer = CaptionStabilizer()
 
-        _ = stabilizer.ingest(CaptionCandidate(text: "We must finish the report before Friday.", isFinal: false))
-        let final = stabilizer.ingest(CaptionCandidate(text: "and finalize the report before Friday.", isFinal: true))
-
-        XCTAssertEqual(final?.kind, .final)
-        XCTAssertEqual(final?.text, "We must finish the report before Friday.")
+        XCTAssertNil(stabilizer.ingest(CaptionCandidate(text: "We need", isFinal: false)))
     }
 
-    func testClearReturnsClearedEvent() {
+    func testClearReturnsClearedEventAndResetsDedup() {
         var stabilizer = CaptionStabilizer()
-        _ = stabilizer.ingest(CaptionCandidate(text: "Bonjour", isFinal: false))
+        let now = Date()
 
+        _ = stabilizer.ingest(CaptionCandidate(text: "Bonjour.", isFinal: true), at: now)
         XCTAssertEqual(stabilizer.clear().kind, .cleared)
+
+        let afterClear = stabilizer.ingest(CaptionCandidate(text: "Bonjour.", isFinal: true), at: now.addingTimeInterval(0.1))
+        XCTAssertNotNil(afterClear)
     }
 }

@@ -72,7 +72,6 @@ public enum SubtitleOverlaySize: String, CaseIterable, Codable, Sendable, Identi
 
 public struct CaptionEvent: Equatable, Sendable {
     public enum Kind: Equatable, Sendable {
-        case draft
         case sourceDraft
         case final
         case speechStarted
@@ -101,10 +100,6 @@ public struct CaptionEvent: Equatable, Sendable {
         self.startTime = startTime
         self.endTime = endTime
         self.createdAt = createdAt
-    }
-
-    public static func draft(_ text: String, sourceText: String? = nil, at date: Date = Date()) -> CaptionEvent {
-        CaptionEvent(kind: .draft, text: text, sourceText: sourceText, createdAt: date)
     }
 
     public static func sourceDraft(_ text: String, at date: Date = Date()) -> CaptionEvent {
@@ -162,6 +157,9 @@ public typealias AudioChunkHandler = @Sendable (PCMAudioChunk) -> Void
 
 public protocol AudioCaptureService: AnyObject {
     var onChunk: AudioChunkHandler? { get set }
+    /// Called when capture ends on its own (permission revoked, device gone,
+    /// stream failure) rather than via stop().
+    var onStopped: (@Sendable (Error?) -> Void)? { get set }
     func start(source: AudioSource) async throws
     func stop() async
 }

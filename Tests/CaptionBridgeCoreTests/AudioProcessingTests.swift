@@ -2,25 +2,11 @@ import XCTest
 @testable import CaptionBridgeCore
 
 final class AudioProcessingTests: XCTestCase {
-    func testDownmixStereoToMonoAveragesFrames() {
-        let stereo: [Float] = [
-            1, -1,
-            0.5, 0.25,
-            -0.25, -0.75
-        ]
+    func testRMSMatchesHandComputedValue() {
+        let samples: [Float] = [0.5, -0.5, 0.5, -0.5]
 
-        XCTAssertEqual(
-            AudioProcessing.downmixToMono(interleaved: stereo, channelCount: 2),
-            [0, 0.375, -0.5]
-        )
-    }
-
-    func testResampleLinearReducesSampleCount() {
-        let samples = Array(repeating: Float(0.5), count: 48_000)
-        let resampled = AudioProcessing.resampleLinear(samples: samples, from: 48_000, to: 16_000)
-
-        XCTAssertEqual(resampled.count, 16_000)
-        XCTAssertEqual(resampled.first, 0.5)
+        XCTAssertEqual(AudioProcessing.rms(samples), 0.5, accuracy: 0.0001)
+        XCTAssertEqual(AudioProcessing.rms([]), 0)
     }
 
     func testSilenceGateRejectsQuietChunks() {
@@ -36,5 +22,12 @@ final class AudioProcessingTests: XCTestCase {
 
         XCTAssertTrue(gate.isSpeech(chunk))
     }
-}
 
+    func testSilenceGateRMSOverloadMatchesChunkPath() {
+        let gate = SilenceGate(rmsThreshold: 0.01, minimumSpeechDuration: 0.2)
+
+        XCTAssertTrue(gate.isSpeech(rms: 0.05, duration: 1))
+        XCTAssertFalse(gate.isSpeech(rms: 0.001, duration: 1))
+        XCTAssertFalse(gate.isSpeech(rms: 0.05, duration: 0.1))
+    }
+}

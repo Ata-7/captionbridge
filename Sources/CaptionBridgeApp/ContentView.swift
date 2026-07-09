@@ -163,6 +163,13 @@ struct ContentView: View {
                             }
                         }
                         .labelsHidden()
+
+                        if viewModel.supportsInstantEnglishDrafts {
+                            Toggle("Instant English drafts", isOn: $viewModel.settings.instantEnglishDraftsEnabled)
+                                .toggleStyle(.checkbox)
+                                .font(.caption)
+                                .help("Translates the live French line into English on-device (Apple Translation) while the speaker is still talking. The polished final caption still comes from Whisper.")
+                        }
                     }
                 }
 
@@ -173,6 +180,8 @@ struct ContentView: View {
                         }
                     }
                     .labelsHidden()
+                    .disabled(isSessionActive)
+                    .help(isSessionActive ? "Stop subtitles before switching models" : "Choose the local Whisper model")
                 }
             }
         }

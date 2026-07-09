@@ -135,6 +135,8 @@ struct ContentView: View {
                         }
                     }
                     .labelsHidden()
+                    .disabled(isSessionActive)
+                    .help(isSessionActive ? "Stop subtitles before switching the input source" : "Choose where meeting audio comes from")
                 }
 
                 pickerCard(title: "Language", icon: "globe") {

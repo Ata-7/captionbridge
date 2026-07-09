@@ -267,13 +267,17 @@ public actor LiveSubtitleCoordinator {
         do {
             let result: SpeechTranslationResult
             if kind.isFinal {
-                // When live drafts already produced the French line, a
-                // translation-only pass halves the final-caption latency.
+                // When live drafts already produced the French line AND they
+                // covered the whole utterance, a translation-only pass halves
+                // the final-caption latency. For utterances longer than the
+                // draft window the dual pass recomputes the full French line
+                // so both languages describe the same audio.
+                let draftsCoverUtterance = sampleCount <= draftWindowSampleCount
                 result = try await engine.translateFinal(
                     audio: inferenceChunk,
                     model: model,
                     languagePair: languagePair,
-                    preferDualOutput: latestSourceText == nil
+                    preferDualOutput: latestSourceText == nil || !draftsCoverUtterance
                 )
             } else {
                 result = try await engine.transcribe(audio: inferenceChunk, model: model, languagePair: languagePair)

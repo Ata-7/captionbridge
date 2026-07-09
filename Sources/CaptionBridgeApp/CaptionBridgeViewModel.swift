@@ -95,7 +95,10 @@ final class CaptionBridgeViewModel: ObservableObject {
 
     init() {
         coordinator = LiveSubtitleCoordinator(engine: engine)
-        (chunkStream, chunkContinuation) = AsyncStream.makeStream(of: PCMAudioChunk.self)
+        (chunkStream, chunkContinuation) = AsyncStream.makeStream(
+            of: PCMAudioChunk.self,
+            bufferingPolicy: .bufferingNewest(256)
+        )
         (signalStream, signalContinuation) = AsyncStream.makeStream(of: CoordinatorSignal.self)
 
         let chunkContinuation = chunkContinuation
@@ -366,6 +369,8 @@ final class CaptionBridgeViewModel: ObservableObject {
         case .running:
             isPaused = true
             sessionState = .paused
+            // Invalidate captions still in flight; they belong to pre-pause audio.
+            sessionEpoch += 1
             draftSubtitle = ""
             draftSourceText = nil
         case .paused:
@@ -533,6 +538,10 @@ final class CaptionBridgeViewModel: ObservableObject {
             return
         }
 
+        if draftSourceText != normalized {
+            // The English line must never describe an older French line.
+            draftSubtitle = ""
+        }
         draftSourceText = normalized
         recordDiagnostic("source draft: \(normalized)")
         updateLiveStatus("French caption ready")
@@ -720,13 +729,17 @@ extension CaptionBridgeViewModel {
         let (stream, continuation) = AsyncStream.makeStream(of: String.self, bufferingPolicy: .bufferingNewest(1))
         frenchDraftContinuation = continuation
 
-        // Downloads the French->English language pack the first time (one
-        // system prompt); afterwards it is a no-op and fully offline.
-        try? await session.prepareTranslation()
-
+        var isPrepared = false
         for await french in stream {
             guard settings.instantEnglishDraftsEnabled else {
                 continue
+            }
+            if !isPrepared {
+                // Downloads the French->English language pack on first use
+                // (one system prompt); afterwards it is a no-op and fully
+                // offline. Deliberately not done while the feature is off.
+                try? await session.prepareTranslation()
+                isPrepared = true
             }
             guard let response = try? await session.translate(french) else {
                 continue

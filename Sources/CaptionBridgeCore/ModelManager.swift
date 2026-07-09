@@ -222,6 +222,7 @@ public actor ModelManager {
     private struct ValidationRecord: Codable {
         var size: Int64
         var modifiedAt: TimeInterval
+        var expectedSHA256: String?
     }
 
     private let modelsDirectory: URL
@@ -289,7 +290,11 @@ public actor ModelManager {
         }
 
         if let existing = activeDownloads[descriptor.id] {
-            return try await existing.value
+            return try await withTaskCancellationHandler {
+                try await existing.value
+            } onCancel: {
+                existing.cancel()
+            }
         }
 
         let task = Task<InstalledModel, Error> {
@@ -315,7 +320,11 @@ public actor ModelManager {
 
         activeDownloads[descriptor.id] = task
         defer { activeDownloads[descriptor.id] = nil }
-        return try await task.value
+        return try await withTaskCancellationHandler {
+            try await task.value
+        } onCancel: {
+            task.cancel()
+        }
     }
 
     public func validateModel(at url: URL, descriptor: ModelDescriptor) throws {
@@ -350,28 +359,32 @@ public actor ModelManager {
         return loaded
     }
 
-    private func fileStats(at url: URL) -> ValidationRecord? {
+    private func fileStats(at url: URL, descriptor: ModelDescriptor) -> ValidationRecord? {
         guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path) else {
             return nil
         }
 
         let size = (attributes[.size] as? NSNumber)?.int64Value ?? 0
         let modified = (attributes[.modificationDate] as? Date)?.timeIntervalSinceReferenceDate ?? 0
-        return ValidationRecord(size: size, modifiedAt: modified)
+        return ValidationRecord(size: size, modifiedAt: modified, expectedSHA256: descriptor.expectedSHA256)
     }
 
     private func isValidatedAndUnchanged(url: URL, descriptor: ModelDescriptor) -> Bool {
         guard let record = loadValidationCache()[descriptor.fileName],
-              let stats = fileStats(at: url)
+              let stats = fileStats(at: url, descriptor: descriptor)
         else {
             return false
         }
 
-        return stats.size == record.size && stats.modifiedAt == record.modifiedAt
+        // The cache entry is only valid for the checksum it was verified
+        // against; a catalog update re-triggers full verification.
+        return stats.size == record.size
+            && stats.modifiedAt == record.modifiedAt
+            && record.expectedSHA256 == descriptor.expectedSHA256
     }
 
     private func recordValidation(for url: URL, descriptor: ModelDescriptor) {
-        guard let stats = fileStats(at: url) else {
+        guard let stats = fileStats(at: url, descriptor: descriptor) else {
             return
         }
 

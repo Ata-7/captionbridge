@@ -47,8 +47,8 @@ LiveSubtitleCoordinator (Swift actor)
         │ every ~0.6 s          │ at each pause
         ▼                       ▼
    French draft            English final
- (Whisper transcribe)   (Whisper translate — single pass,
-        │                reuses the draft's French line)
+ (Whisper transcribe)   (Whisper translate — single pass
+        │                when drafts cover the utterance)
         ▼
  Instant English draft (Apple Translation, macOS 15+)
         │
@@ -111,9 +111,10 @@ The point isn't that AI wrote the code. It's that a clear problem, honest verifi
 ## Roadmap
 
 - More language pairs (the pipeline is language-agnostic; UI and non-speech filters need generalizing)
-- Notarized releases with a Developer ID certificate
+- Notarized releases with a Developer ID certificate (packaging already applies hardened runtime + timestamp when `CAPTIONBRIDGE_CODESIGN_IDENTITY` is set)
+- VoiceOver announcements and keyboard access for the overlay
 - Saved transcripts as an explicit opt-in export
 
 ## License
 
-[MIT](LICENSE) — © 2026 Mustafa Ataoğlu
+[MIT](LICENSE) — © 2026 Mustafa Ataoğlu. Bundled third-party components are listed in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).

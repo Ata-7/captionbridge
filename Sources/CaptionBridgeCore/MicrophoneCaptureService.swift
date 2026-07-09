@@ -11,6 +11,7 @@ public final class MicrophoneCaptureService: AudioCaptureService, @unchecked Sen
     private let stateQueue = DispatchQueue(label: "CaptionBridge.MicrophoneCapture")
     private var converter: AVAudioConverter?
     private var configurationObserver: NSObjectProtocol?
+    private var isCapturing = false
 
     public init() {}
 
@@ -62,9 +63,16 @@ public final class MicrophoneCaptureService: AudioCaptureService, @unchecked Sen
 
         engine.prepare()
         try engine.start()
+        isCapturing = true
     }
 
     private func restartAfterConfigurationChange() {
+        // Never touch the microphone unless a session explicitly started it —
+        // a device change while idle must not reopen capture.
+        guard isCapturing else {
+            return
+        }
+
         engine.inputNode.removeTap(onBus: 0)
 
         let inputFormat = engine.inputNode.inputFormat(forBus: 0)
@@ -118,6 +126,7 @@ public final class MicrophoneCaptureService: AudioCaptureService, @unchecked Sen
     }
 
     public func stop() async {
+        isCapturing = false
         if engine.isRunning {
             engine.stop()
         }

@@ -23,11 +23,18 @@ SIGN_KEYCHAIN="${CAPTIONBRIDGE_CODESIGN_KEYCHAIN:-}"
 cd "$ROOT_DIR"
 trap 'rm -rf "$STAGE_ROOT"' EXIT
 
+# Real (non ad-hoc) identities get hardened runtime + secure timestamp so a
+# Developer ID build is notarization-ready out of the box.
+HARDENING_FLAGS=""
+if [ "$SIGN_IDENTITY" != "-" ]; then
+  HARDENING_FLAGS="--options runtime --timestamp"
+fi
+
 sign_plain() {
   if [ -n "$SIGN_KEYCHAIN" ]; then
-    codesign --force --keychain "$SIGN_KEYCHAIN" --sign "$SIGN_IDENTITY" "$1"
+    codesign --force $HARDENING_FLAGS --keychain "$SIGN_KEYCHAIN" --sign "$SIGN_IDENTITY" "$1"
   else
-    codesign --force --sign "$SIGN_IDENTITY" "$1"
+    codesign --force $HARDENING_FLAGS --sign "$SIGN_IDENTITY" "$1"
   fi
 }
 
@@ -39,9 +46,9 @@ sign_app() {
       codesign --force --sign "$SIGN_IDENTITY" --entitlements "$ENTITLEMENTS_FILE" -i "com.captionbridge.mac" -r "$LOCAL_REQUIREMENT" "$APP_DIR"
     fi
   elif [ -n "$SIGN_KEYCHAIN" ]; then
-    codesign --force --keychain "$SIGN_KEYCHAIN" --sign "$SIGN_IDENTITY" --entitlements "$ENTITLEMENTS_FILE" -i "com.captionbridge.mac" "$APP_DIR"
+    codesign --force $HARDENING_FLAGS --keychain "$SIGN_KEYCHAIN" --sign "$SIGN_IDENTITY" --entitlements "$ENTITLEMENTS_FILE" -i "com.captionbridge.mac" "$APP_DIR"
   else
-    codesign --force --sign "$SIGN_IDENTITY" --entitlements "$ENTITLEMENTS_FILE" -i "com.captionbridge.mac" "$APP_DIR"
+    codesign --force $HARDENING_FLAGS --sign "$SIGN_IDENTITY" --entitlements "$ENTITLEMENTS_FILE" -i "com.captionbridge.mac" "$APP_DIR"
   fi
 }
 

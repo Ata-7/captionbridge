@@ -285,6 +285,7 @@ public final class PersistentWhisperTranslationEngine: SpeechTranslationEngine, 
         var output: FileHandle?
         var lastActivityAt = Date()
         var isWorkerBusy = false
+        var isStallWatchdogArmed = false
 
         var hasRunningProcess: Bool {
             lock.lock()
@@ -306,6 +307,30 @@ public final class PersistentWhisperTranslationEngine: SpeechTranslationEngine, 
                 lastActivityAt = Date()
             }
             lock.unlock()
+        }
+
+        /// Arms the watchdog if it isn't already running. Returns true when
+        /// the caller should start the recheck loop.
+        func armStallWatchdog() -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            guard isWorkerBusy, !isStallWatchdogArmed else {
+                return false
+            }
+            isStallWatchdogArmed = true
+            return true
+        }
+
+        func disarmStallWatchdog() {
+            lock.lock()
+            isStallWatchdogArmed = false
+            lock.unlock()
+        }
+
+        var isBusy: Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return isWorkerBusy
         }
 
         /// True when the worker has been waiting on the helper with zero
@@ -462,10 +487,14 @@ public final class PersistentWhisperTranslationEngine: SpeechTranslationEngine, 
                 // The caller has moved on, but the helper keeps the loaded
                 // model and finishes in the background; the next request
                 // drains the stale response. Only a genuine hang (no output
-                // progress at all) justifies killing the process.
+                // progress at all) justifies killing the process — and a
+                // watchdog keeps checking so a hang is caught even if no
+                // further requests arrive.
                 if self.processState.isStalled(beyond: self.stallKillInterval) {
                     self.processState.terminate()
                     self.processState.clear()
+                } else {
+                    self.startStallWatchdogIfNeeded()
                 }
             }
         }
@@ -650,6 +679,32 @@ public final class PersistentWhisperTranslationEngine: SpeechTranslationEngine, 
             data.append(chunk)
         }
         return data
+    }
+
+    private func startStallWatchdogIfNeeded() {
+        guard processState.armStallWatchdog() else {
+            return
+        }
+        scheduleStallRecheck()
+    }
+
+    private func scheduleStallRecheck() {
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 5) { [weak self] in
+            guard let self else {
+                return
+            }
+            guard self.processState.isBusy else {
+                self.processState.disarmStallWatchdog()
+                return
+            }
+            if self.processState.isStalled(beyond: self.stallKillInterval) {
+                self.processState.disarmStallWatchdog()
+                self.processState.terminate()
+                self.processState.clear()
+            } else {
+                self.scheduleStallRecheck()
+            }
+        }
     }
 
     private func restartHelper() {

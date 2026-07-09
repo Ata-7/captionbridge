@@ -11,11 +11,11 @@ CaptionBridge listens to your Mac's system audio (Teams, Zoom, Meet, a browser t
 
 ## Why this exists
 
-My wife works with a French-speaking team over Microsoft Teams. Company policy disables Teams' built-in transcription and translation, and her French is still intermediate — so she was spending meetings half-translating instead of participating.
+Meetings move fast when they're not in your strongest language. Live translated captions close that gap — but in many workplaces the built-in transcription and translation features of meeting tools are switched off for confidentiality reasons, and sending meeting audio to a cloud captioning service is a non-starter for the same reason.
 
-Cloud captioning tools were off the table (meeting audio is confidential), so the solution had to be a **local-only** app: transcribe French speech on the Mac itself, translate it on the Mac itself, and show it as unobtrusive live subtitles that are easy to follow mid-meeting.
+CaptionBridge was built for exactly that everyday situation. It produces live, translated subtitles **entirely on the Mac itself**: nothing is recorded, nothing leaves the machine, and it works with any meeting app because it listens to system audio instead of plugging into the meeting software.
 
-I'm not a professional developer — I'm an operations/PMO professional who builds working software by directing AI coding tools. CaptionBridge was built with **OpenAI Codex** and then deeply revised — performance, stability, and a full multi-angle code review — with **Claude Code**. Every architectural decision (latency budgets, privacy constraints, failure recovery) was driven by watching the app in real meetings and iterating.
+I'm an operations/PMO professional rather than a professional developer — I build working software by directing AI coding tools. CaptionBridge was built with **OpenAI Codex** and then deeply revised — performance, stability, and a full multi-angle code review — with **Claude Code**. Every architectural decision (latency budgets, privacy constraints, failure recovery) came from watching the app in daily real-world use and iterating.
 
 ## Features
 

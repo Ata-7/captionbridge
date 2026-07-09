@@ -29,10 +29,12 @@ public actor LiveSubtitleCoordinator {
     private let sampleRate: Int
     private let draftWindowSampleCount: Int
     private let speechAnalysisSampleCount: Int
+    private let forcedBoundaryAnalysisSampleCount: Int
     private let minimumInferenceSampleCount: Int
     private let minimumSourceDraftProcessingInterval: TimeInterval
     private let trailingSilenceDuration: TimeInterval
     private let maximumUtteranceDuration: TimeInterval
+    private let hardMaximumUtteranceDuration: TimeInterval
     private let finalWindowSampleCount: Int
     private let ringBuffer: FloatRingBuffer
 
@@ -45,8 +47,12 @@ public actor LiveSubtitleCoordinator {
     private var lastSourceDraft = ""
     private var lastRawSourceDraft = ""
     private var latestSourceText: String?
+    private var latestSourceDraftStartSampleIndex: Int64?
+    private var latestSourceDraftEndSampleIndex: Int64?
     private var lastSpeechDetectedAt: Date?
     private var speechStartedAt: Date?
+    private var speechStartedSampleIndex: Int64?
+    private var lastSpeechSampleIndex: Int64?
     private var hasSpeechInBuffer = false
     private var sampleCursor: Int64 = 0
     private var bufferStartSampleIndex: Int64 = 0
@@ -62,23 +68,31 @@ public actor LiveSubtitleCoordinator {
         sampleRate: Int = 16_000,
         windowDuration: TimeInterval = 4.8,
         speechAnalysisDuration: TimeInterval = 0.25,
+        forcedBoundaryAnalysisDuration: TimeInterval = 0.1,
         minimumInferenceDuration: TimeInterval = 0.65,
         minimumProcessingInterval: TimeInterval = 0.55,
         speechHoldDuration: TimeInterval = 1.6,
         maxUtteranceDuration: TimeInterval = 10.0,
         trailingSilenceDuration: TimeInterval = 0.45,
-        maximumUtteranceDuration: TimeInterval = 5.2
+        maximumUtteranceDuration: TimeInterval = 5.2,
+        hardMaximumUtteranceDuration: TimeInterval? = nil
     ) {
         self.engine = engine
         self.silenceGate = silenceGate
         self.sampleRate = sampleRate
         self.draftWindowSampleCount = max(1, Int(Double(sampleRate) * windowDuration))
         self.speechAnalysisSampleCount = max(1, Int(Double(sampleRate) * speechAnalysisDuration))
+        self.forcedBoundaryAnalysisSampleCount = max(1, Int(Double(sampleRate) * forcedBoundaryAnalysisDuration))
         self.minimumInferenceSampleCount = max(1, Int(Double(sampleRate) * minimumInferenceDuration))
         self.minimumSourceDraftProcessingInterval = minimumProcessingInterval
         self.trailingSilenceDuration = min(speechHoldDuration, trailingSilenceDuration)
         self.maximumUtteranceDuration = maximumUtteranceDuration
-        self.finalWindowSampleCount = max(1, Int(Double(sampleRate) * (maximumUtteranceDuration + 2)))
+        let defaultHardLimitGrace = min(1.2, max(0.1, maximumUtteranceDuration * 0.25))
+        self.hardMaximumUtteranceDuration = max(
+            maximumUtteranceDuration,
+            hardMaximumUtteranceDuration ?? maximumUtteranceDuration + defaultHardLimitGrace
+        )
+        self.finalWindowSampleCount = max(1, Int(Double(sampleRate) * (self.hardMaximumUtteranceDuration + 1)))
         self.ringBuffer = FloatRingBuffer(capacity: max(1, Int(Double(sampleRate) * maxUtteranceDuration)))
     }
 
@@ -106,6 +120,7 @@ public actor LiveSubtitleCoordinator {
             markSpeechDetected(
                 at: audioNow,
                 chunkStartSampleIndex: chunkStartSampleIndex,
+                chunkEndSampleIndex: sampleCursor,
                 emit: emit
             )
         }
@@ -123,7 +138,13 @@ public actor LiveSubtitleCoordinator {
         let trailingSilence = lastSpeechDetectedAt.map { audioNow.timeIntervalSince($0) } ?? 0
         let utteranceDuration = speechStartedAt.map { audioNow.timeIntervalSince($0) } ?? 0
         let shouldFinalize = !isSpeechNow && trailingSilence >= trailingSilenceDuration
-        let shouldForceFinal = utteranceDuration >= maximumUtteranceDuration
+        // The normal cap is a soft boundary: after it, finish at the first
+        // brief low-energy gap instead of cutting through a spoken word. The
+        // hard cap still bounds latency for genuinely nonstop audio.
+        let isAtBriefBoundary = ringBuffer.suffixRMS(forcedBoundaryAnalysisSampleCount) < silenceGate.rmsThreshold
+        let shouldForceAtBoundary = utteranceDuration >= maximumUtteranceDuration && isAtBriefBoundary
+        let shouldForceAtHardLimit = utteranceDuration >= hardMaximumUtteranceDuration
+        let shouldForceFinal = shouldForceAtBoundary || shouldForceAtHardLimit
 
         if shouldFinalize || shouldForceFinal {
             await process(
@@ -178,6 +199,8 @@ public actor LiveSubtitleCoordinator {
         inferenceTicket += 1
         resetAudioAndSpeechState()
         isProcessing = false
+        expectContinuationDraft = false
+        consecutiveFinalFailures = 0
     }
 
     private func resetAudioAndSpeechState() {
@@ -187,8 +210,12 @@ public actor LiveSubtitleCoordinator {
         lastSourceDraft = ""
         lastRawSourceDraft = ""
         latestSourceText = nil
+        latestSourceDraftStartSampleIndex = nil
+        latestSourceDraftEndSampleIndex = nil
         lastSpeechDetectedAt = nil
         speechStartedAt = nil
+        speechStartedSampleIndex = nil
+        lastSpeechSampleIndex = nil
         hasSpeechInBuffer = false
         sampleCursor = 0
         bufferStartSampleIndex = 0
@@ -199,11 +226,14 @@ public actor LiveSubtitleCoordinator {
     private func markSpeechDetected(
         at date: Date,
         chunkStartSampleIndex: Int64,
+        chunkEndSampleIndex: Int64,
         emit: @Sendable (CaptionEvent) -> Void
     ) {
         let isSpeechAfterFinalizing = finalizingThroughSampleIndex.map { chunkStartSampleIndex >= $0 } ?? false
         if !hasSpeechInBuffer || (isSpeechAfterFinalizing && !speechStartedAfterFinalizing) {
             speechStartedAt = date
+            let preRoll = Int64(Double(sampleRate) * 0.3)
+            speechStartedSampleIndex = max(bufferStartSampleIndex, chunkStartSampleIndex - preRoll)
             emit(.speechStarted(at: date))
             if isSpeechAfterFinalizing {
                 speechStartedAfterFinalizing = true
@@ -212,6 +242,7 @@ public actor LiveSubtitleCoordinator {
 
         hasSpeechInBuffer = true
         lastSpeechDetectedAt = date
+        lastSpeechSampleIndex = chunkEndSampleIndex
     }
 
     private func process(
@@ -235,6 +266,7 @@ public actor LiveSubtitleCoordinator {
 
         let samples = ringBuffer.suffix(sampleCount)
         let snapshotEndSampleIndex = sampleCursor
+        let snapshotStartSampleIndex = snapshotEndSampleIndex - Int64(samples.count)
         let snapshotStartedAt = Date().addingTimeInterval(-TimeInterval(samples.count) / TimeInterval(sampleRate))
         let localGeneration = generation
         inferenceTicket += 1
@@ -267,12 +299,14 @@ public actor LiveSubtitleCoordinator {
         do {
             let result: SpeechTranslationResult
             if kind.isFinal {
-                // When live drafts already produced the French line AND they
-                // covered the whole utterance, a translation-only pass halves
-                // the final-caption latency. For utterances longer than the
-                // draft window the dual pass recomputes the full French line
-                // so both languages describe the same audio.
-                let draftsCoverUtterance = sampleCount <= draftWindowSampleCount
+                // Reuse French only when its inference snapshot covered the
+                // complete speech range used by this final. Window duration
+                // alone is insufficient: an early partial draft can exist for
+                // a short sentence that continued speaking afterwards.
+                let relevantSpeechStart = speechStartedSampleIndex ?? snapshotStartSampleIndex
+                let relevantSpeechEnd = lastSpeechSampleIndex ?? snapshotEndSampleIndex
+                let draftsCoverUtterance = latestSourceDraftStartSampleIndex.map { $0 <= relevantSpeechStart } == true
+                    && latestSourceDraftEndSampleIndex.map { $0 >= relevantSpeechEnd } == true
                 result = try await engine.translateFinal(
                     audio: inferenceChunk,
                     model: model,
@@ -288,7 +322,12 @@ public actor LiveSubtitleCoordinator {
 
             if !kind.isFinal {
                 lastDraftInferenceDuration = Date().timeIntervalSince(inferenceStartedAt)
-                emitSourceDraft(result.text, emit: emit)
+                emitSourceDraft(
+                    result.text,
+                    snapshotStartSampleIndex: snapshotStartSampleIndex,
+                    snapshotEndSampleIndex: snapshotEndSampleIndex,
+                    emit: emit
+                )
                 return
             }
 
@@ -361,6 +400,8 @@ public actor LiveSubtitleCoordinator {
         lastSourceDraft = ""
         lastRawSourceDraft = ""
         latestSourceText = nil
+        latestSourceDraftStartSampleIndex = nil
+        latestSourceDraftEndSampleIndex = nil
 
         if speechStartedAfterFinalizing {
             hasSpeechInBuffer = true
@@ -373,10 +414,14 @@ public actor LiveSubtitleCoordinator {
         hasSpeechInBuffer = false
         lastSpeechDetectedAt = nil
         speechStartedAt = nil
+        speechStartedSampleIndex = nil
+        lastSpeechSampleIndex = nil
     }
 
     private func emitSourceDraft(
         _ text: String,
+        snapshotStartSampleIndex: Int64,
+        snapshotEndSampleIndex: Int64,
         emit: @Sendable (CaptionEvent) -> Void
     ) {
         let normalized = CaptionText.collapseWhitespace(text)
@@ -389,19 +434,32 @@ public actor LiveSubtitleCoordinator {
             lastRawSourceDraft = normalized
         }
 
-        guard shouldEmitSourceDraft(normalized), normalized != lastSourceDraft else {
+        let shouldEmit = shouldEmitSourceDraft(normalized)
+        guard shouldEmit || normalized == lastSourceDraft else {
+            return
+        }
+
+        latestSourceText = normalized
+        latestSourceDraftStartSampleIndex = snapshotStartSampleIndex
+        latestSourceDraftEndSampleIndex = snapshotEndSampleIndex
+        expectContinuationDraft = false
+
+        guard normalized != lastSourceDraft else {
             return
         }
 
         lastSourceDraft = normalized
-        latestSourceText = normalized
-        expectContinuationDraft = false
         emit(.sourceDraft(normalized))
     }
 
     private func isCredibleSourceDraft(_ text: String) -> Bool {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
+            return false
+        }
+
+        let allWords = CaptionText.words(in: trimmed, minimumLength: 1)
+        guard allWords.count <= 48, !hasExcessiveConsecutiveRepetition(allWords) else {
             return false
         }
 
@@ -416,6 +474,40 @@ public actor LiveSubtitleCoordinator {
 
         let words = sourceDraftWords(in: trimmed)
         return words.count >= 2
+    }
+
+    private func hasExcessiveConsecutiveRepetition(_ words: [String]) -> Bool {
+        guard words.count >= 6 else {
+            return false
+        }
+
+        let maximumPhraseLength = min(6, words.count / 3)
+        for phraseLength in 1...maximumPhraseLength {
+            let requiredRepeats = phraseLength == 1 ? 5 : 3
+            let requiredWordCount = phraseLength * requiredRepeats
+            guard words.count >= requiredWordCount else {
+                continue
+            }
+
+            for start in 0...(words.count - requiredWordCount) {
+                let phrase = words[start..<(start + phraseLength)]
+                var repeats = 1
+                while repeats < requiredRepeats {
+                    let comparisonStart = start + repeats * phraseLength
+                    let comparison = words[comparisonStart..<(comparisonStart + phraseLength)]
+                    guard phrase.elementsEqual(comparison) else {
+                        break
+                    }
+                    repeats += 1
+                }
+
+                if repeats == requiredRepeats {
+                    return true
+                }
+            }
+        }
+
+        return false
     }
 
     private func isCredibleFinalCaption(text: String, sourceText: String?) -> Bool {
@@ -435,7 +527,8 @@ public actor LiveSubtitleCoordinator {
             return false
         }
 
-        return !translatedWords.isEmpty
+        let sourceWords = sourceDraftWords(in: source)
+        return translatedWords.count >= 3 || sourceWords.count >= 3
     }
 
     private func shouldEmitSourceDraft(_ text: String) -> Bool {
@@ -486,7 +579,11 @@ public actor LiveSubtitleCoordinator {
             "klaxon",
             "applaud",
             "silence",
-            "tap tap"
+            "tap tap",
+            "merci d'avoir regardé",
+            "merci de regarder",
+            "sous-titres réalisés",
+            "abonnez-vous"
         ]
         return nonSpeechMarkers.contains { stripped.contains($0) }
     }

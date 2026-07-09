@@ -96,6 +96,10 @@ struct ContentView: View {
     }
 
     private var statusText: String {
+        if viewModel.isPauseTransitionPending {
+            return "Resuming"
+        }
+
         switch viewModel.sessionState {
         case .idle:
             return "Idle"
@@ -111,6 +115,10 @@ struct ContentView: View {
     }
 
     private var statusColor: Color {
+        if viewModel.isPauseTransitionPending {
+            return .orange
+        }
+
         switch viewModel.sessionState {
         case .idle:
             return .secondary
@@ -182,8 +190,8 @@ struct ContentView: View {
                         }
                     }
                     .labelsHidden()
-                    .disabled(isSessionActive)
-                    .help(isSessionActive ? "Stop subtitles before switching models" : "Choose the local Whisper model")
+                    .disabled(isSessionActive || viewModel.modelDownloadProgress != nil)
+                    .help(modelPickerHelp)
                 }
             }
         }
@@ -285,10 +293,13 @@ struct ContentView: View {
             Button {
                 viewModel.pauseOrResume()
             } label: {
-                Label(isPaused ? "Resume" : "Pause", systemImage: isPaused ? "play.fill" : "pause.fill")
+                Label(
+                    viewModel.isPauseTransitionPending ? "Resuming" : (isPaused ? "Resume" : "Pause"),
+                    systemImage: isPaused ? "play.fill" : "pause.fill"
+                )
             }
             .controlSize(.large)
-            .disabled(!canPauseOrResume)
+            .disabled(!canPauseOrResume || viewModel.isPauseTransitionPending)
 
             Button {
                 viewModel.stopSubtitles()
@@ -460,11 +471,21 @@ struct ContentView: View {
 
     private var canStop: Bool {
         switch viewModel.sessionState {
-        case .running, .paused:
+        case .preparing, .running, .paused:
             return true
-        case .idle, .preparing, .failed:
+        case .idle, .failed:
             return false
         }
+    }
+
+    private var modelPickerHelp: String {
+        if viewModel.modelDownloadProgress != nil {
+            return "Cancel the current download before switching models"
+        }
+        if isSessionActive {
+            return "Stop subtitles before switching models"
+        }
+        return "Choose the local Whisper model"
     }
 
     private var isPaused: Bool {

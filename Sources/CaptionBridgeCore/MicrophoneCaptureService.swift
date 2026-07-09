@@ -3,15 +3,24 @@ import AVFAudio
 import Foundation
 
 public final class MicrophoneCaptureService: AudioCaptureService, @unchecked Sendable {
-    public var onChunk: AudioChunkHandler?
-    public var onStopped: (@Sendable (Error?) -> Void)?
+    public var onChunk: AudioChunkHandler? {
+        get { stateQueue.sync { chunkHandler } }
+        set { stateQueue.sync { chunkHandler = newValue } }
+    }
+    public var onStopped: (@Sendable (Error?) -> Void)? {
+        get { stateQueue.sync { stoppedHandler } }
+        set { stateQueue.sync { stoppedHandler = newValue } }
+    }
 
     private let engine = AVAudioEngine()
     private let targetSampleRate = 16_000
     private let stateQueue = DispatchQueue(label: "CaptionBridge.MicrophoneCapture")
+    private let callbackQueue = DispatchQueue(label: "CaptionBridge.MicrophoneCapture.Callbacks")
     private var converter: AVAudioConverter?
     private var configurationObserver: NSObjectProtocol?
     private var isCapturing = false
+    private var chunkHandler: AudioChunkHandler?
+    private var stoppedHandler: (@Sendable (Error?) -> Void)?
 
     public init() {}
 
@@ -25,83 +34,88 @@ public final class MicrophoneCaptureService: AudioCaptureService, @unchecked Sen
         await stop()
         try await requestMicrophonePermissionIfNeeded()
 
-        let inputNode = engine.inputNode
-        let inputFormat = inputNode.inputFormat(forBus: 0)
-        // A Mac without any input device reports a 0 Hz format; installing a
-        // tap with it raises an uncatchable Objective-C exception.
-        guard inputFormat.sampleRate > 0, inputFormat.channelCount > 0 else {
-            throw AudioCaptureError.microphoneUnavailable
-        }
-
-        guard let outputFormat = AVAudioFormat(
-            commonFormat: .pcmFormatFloat32,
-            sampleRate: Double(targetSampleRate),
-            channels: 1,
-            interleaved: false
-        ) else {
-            throw AudioCaptureError.unsupportedFormat
-        }
-
-        stateQueue.sync {
-            converter = AVAudioConverter(from: inputFormat, to: outputFormat)
-        }
-        inputNode.installTap(onBus: 0, bufferSize: 4096, format: inputFormat) { [weak self] buffer, _ in
-            self?.handle(buffer: buffer, outputFormat: outputFormat)
-        }
-
-        if configurationObserver == nil {
-            configurationObserver = NotificationCenter.default.addObserver(
-                forName: .AVAudioEngineConfigurationChange,
-                object: engine,
-                queue: nil
-            ) { [weak self] _ in
-                // The input device changed (e.g. AirPods connected). The tap
-                // format is stale; restart the engine path.
-                self?.restartAfterConfigurationChange()
+        try stateQueue.sync {
+            let inputNode = engine.inputNode
+            let inputFormat = inputNode.inputFormat(forBus: 0)
+            // A Mac without any input device reports a 0 Hz format; installing a
+            // tap with it raises an uncatchable Objective-C exception.
+            guard inputFormat.sampleRate > 0, inputFormat.channelCount > 0 else {
+                throw AudioCaptureError.microphoneUnavailable
             }
-        }
 
-        engine.prepare()
-        try engine.start()
-        isCapturing = true
+            guard let outputFormat = AVAudioFormat(
+                commonFormat: .pcmFormatFloat32,
+                sampleRate: Double(targetSampleRate),
+                channels: 1,
+                interleaved: false
+            ) else {
+                throw AudioCaptureError.unsupportedFormat
+            }
+
+            self.converter = AVAudioConverter(from: inputFormat, to: outputFormat)
+            inputNode.installTap(onBus: 0, bufferSize: 4096, format: inputFormat) { [weak self] buffer, _ in
+                self?.handle(buffer: buffer, outputFormat: outputFormat)
+            }
+
+            if configurationObserver == nil {
+                configurationObserver = NotificationCenter.default.addObserver(
+                    forName: .AVAudioEngineConfigurationChange,
+                    object: engine,
+                    queue: nil
+                ) { [weak self] _ in
+                    // The input device changed (e.g. AirPods connected). The tap
+                    // format is stale; restart the engine path.
+                    self?.restartAfterConfigurationChange()
+                }
+            }
+
+            engine.prepare()
+            try engine.start()
+            isCapturing = true
+        }
     }
 
     private func restartAfterConfigurationChange() {
-        // Never touch the microphone unless a session explicitly started it —
-        // a device change while idle must not reopen capture.
-        guard isCapturing else {
-            return
-        }
-
-        engine.inputNode.removeTap(onBus: 0)
-
-        let inputFormat = engine.inputNode.inputFormat(forBus: 0)
-        guard inputFormat.sampleRate > 0, inputFormat.channelCount > 0,
-              let outputFormat = AVAudioFormat(
-                  commonFormat: .pcmFormatFloat32,
-                  sampleRate: Double(targetSampleRate),
-                  channels: 1,
-                  interleaved: false
-              )
-        else {
-            onStopped?(AudioCaptureError.microphoneUnavailable)
-            return
-        }
-
-        stateQueue.sync {
-            converter = AVAudioConverter(from: inputFormat, to: outputFormat)
-        }
-        engine.inputNode.installTap(onBus: 0, bufferSize: 4096, format: inputFormat) { [weak self] buffer, _ in
-            self?.handle(buffer: buffer, outputFormat: outputFormat)
-        }
-
-        if !engine.isRunning {
-            engine.prepare()
-            do {
-                try engine.start()
-            } catch {
-                onStopped?(error)
+        stateQueue.async { [weak self] in
+            guard let self, self.isCapturing else {
+                return
             }
+
+            self.engine.inputNode.removeTap(onBus: 0)
+
+            let inputFormat = self.engine.inputNode.inputFormat(forBus: 0)
+            guard inputFormat.sampleRate > 0, inputFormat.channelCount > 0,
+                  let outputFormat = AVAudioFormat(
+                      commonFormat: .pcmFormatFloat32,
+                      sampleRate: Double(self.targetSampleRate),
+                      channels: 1,
+                      interleaved: false
+                  )
+            else {
+                self.deliverStopped(AudioCaptureError.microphoneUnavailable)
+                return
+            }
+
+            self.converter = AVAudioConverter(from: inputFormat, to: outputFormat)
+            self.engine.inputNode.installTap(onBus: 0, bufferSize: 4096, format: inputFormat) { [weak self] buffer, _ in
+                self?.handle(buffer: buffer, outputFormat: outputFormat)
+            }
+
+            if !self.engine.isRunning {
+                self.engine.prepare()
+                do {
+                    try self.engine.start()
+                } catch {
+                    self.deliverStopped(error)
+                }
+            }
+        }
+    }
+
+    private func deliverStopped(_ error: Error) {
+        let handler = stoppedHandler
+        callbackQueue.async {
+            handler?(error)
         }
     }
 
@@ -126,25 +140,33 @@ public final class MicrophoneCaptureService: AudioCaptureService, @unchecked Sen
     }
 
     public func stop() async {
-        isCapturing = false
-        if engine.isRunning {
-            engine.stop()
-        }
-        engine.inputNode.removeTap(onBus: 0)
         stateQueue.sync {
+            isCapturing = false
+            if engine.isRunning {
+                engine.stop()
+            }
+            engine.inputNode.removeTap(onBus: 0)
             converter = nil
         }
     }
 
     private func handle(buffer: AVAudioPCMBuffer, outputFormat: AVAudioFormat) {
-        let activeConverter: AVAudioConverter? = stateQueue.sync {
+        let conversionState: (AVAudioConverter, AudioChunkHandler?)? = stateQueue.sync {
+            guard isCapturing else {
+                return nil
+            }
+
             if converter == nil || converter?.inputFormat != buffer.format {
                 converter = AVAudioConverter(from: buffer.format, to: outputFormat)
             }
-            return converter
+
+            guard let converter else {
+                return nil
+            }
+            return (converter, chunkHandler)
         }
 
-        guard let activeConverter else {
+        guard let (activeConverter, handler) = conversionState else {
             return
         }
 
@@ -154,17 +176,10 @@ public final class MicrophoneCaptureService: AudioCaptureService, @unchecked Sen
             return
         }
 
-        var didProvideInput = false
+        let inputProvider = AVAudioConverterInputProvider(buffer: buffer)
         var conversionError: NSError?
         activeConverter.convert(to: output, error: &conversionError) { _, status in
-            if didProvideInput {
-                status.pointee = .noDataNow
-                return nil
-            }
-
-            didProvideInput = true
-            status.pointee = .haveData
-            return buffer
+            inputProvider.next(status: status)
         }
 
         guard conversionError == nil,
@@ -175,6 +190,6 @@ public final class MicrophoneCaptureService: AudioCaptureService, @unchecked Sen
         }
 
         let samples = Array(UnsafeBufferPointer(start: channelData[0], count: Int(output.frameLength)))
-        onChunk?(PCMAudioChunk(samples: samples, sampleRate: targetSampleRate))
+        handler?(PCMAudioChunk(samples: samples, sampleRate: targetSampleRate))
     }
 }

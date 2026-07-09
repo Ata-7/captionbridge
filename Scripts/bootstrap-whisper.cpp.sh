@@ -6,6 +6,7 @@ TOOLS_DIR="$ROOT_DIR/.build/whisper.cpp"
 REPO_DIR="$TOOLS_DIR/source"
 BUILD_DIR="$REPO_DIR/build"
 LOCAL_CMAKE="$ROOT_DIR/.build/python-packages/cmake/data/bin/cmake"
+WHISPER_VERSION="v1.7.6"
 
 if [ -x "$LOCAL_CMAKE" ]; then
   CMAKE="$LOCAL_CMAKE"
@@ -19,7 +20,18 @@ fi
 mkdir -p "$TOOLS_DIR"
 
 if [ ! -d "$REPO_DIR/.git" ]; then
-  git clone --depth 1 --branch v1.7.6 https://github.com/ggerganov/whisper.cpp.git "$REPO_DIR"
+  git clone --depth 1 --branch "$WHISPER_VERSION" https://github.com/ggerganov/whisper.cpp.git "$REPO_DIR"
+else
+  if ! git -C "$REPO_DIR" diff --quiet || ! git -C "$REPO_DIR" diff --cached --quiet; then
+    echo "Existing whisper.cpp checkout has local changes; refusing to package an unverified dependency." >&2
+    exit 1
+  fi
+
+  ACTUAL_VERSION="$(git -C "$REPO_DIR" describe --tags --exact-match HEAD 2>/dev/null || true)"
+  if [ "$ACTUAL_VERSION" != "$WHISPER_VERSION" ]; then
+    echo "Existing whisper.cpp checkout is $ACTUAL_VERSION; expected $WHISPER_VERSION. Remove $REPO_DIR and rerun this script." >&2
+    exit 1
+  fi
 fi
 
 "$CMAKE" -S "$REPO_DIR" -B "$BUILD_DIR" \

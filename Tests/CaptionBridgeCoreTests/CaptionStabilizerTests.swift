@@ -34,6 +34,23 @@ final class CaptionStabilizerTests: XCTestCase {
         XCTAssertEqual(laterRepeat?.text, "Merci.")
     }
 
+    func testRepeatedSentenceWithDistinctAudioRangeIsShownImmediately() {
+        var stabilizer = CaptionStabilizer(duplicateSuppressionWindow: 5)
+        let now = Date()
+
+        let first = stabilizer.ingest(
+            CaptionCandidate(text: "Merci.", isFinal: true, startTime: 10, endTime: 11),
+            at: now
+        )
+        let separateUtterance = stabilizer.ingest(
+            CaptionCandidate(text: "Merci.", isFinal: true, startTime: 12, endTime: 13),
+            at: now.addingTimeInterval(1)
+        )
+
+        XCTAssertNotNil(first)
+        XCTAssertNotNil(separateUtterance)
+    }
+
     func testNonFinalCandidatesAreIgnored() {
         var stabilizer = CaptionStabilizer()
 

@@ -68,6 +68,8 @@ mkdir -p "$MACOS_DIR" "$RESOURCES_DIR"
 
 cp "$BINARY" "$MACOS_DIR/$APP_NAME"
 cp "$ROOT_DIR/Packaging/CaptionBridge-Info.plist" "$CONTENTS_DIR/Info.plist"
+cp "$ROOT_DIR/LICENSE" "$RESOURCES_DIR/LICENSE"
+cp "$ROOT_DIR/THIRD-PARTY-NOTICES.md" "$RESOURCES_DIR/THIRD-PARTY-NOTICES.md"
 printf 'APPL????' > "$CONTENTS_DIR/PkgInfo"
 
 if [ -f "$ROOT_DIR/Packaging/AppIcon.icns" ]; then

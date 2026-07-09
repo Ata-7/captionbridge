@@ -109,21 +109,104 @@ public enum ModelManagerError: LocalizedError, Equatable {
     }
 }
 
+private struct ModelValidationFingerprint: Equatable {
+    let size: Int64
+    let modifiedAt: TimeInterval
+    let createdAt: TimeInterval
+    let deviceIdentifier: UInt64
+    let fileIdentifier: UInt64
+    let expectedSHA256: String?
+    let minimumFileSizeBytes: Int64
+}
+
+private enum ModelValidationStateError: Error {
+    case fileChangedDuringValidation
+}
+
+/// A successful checksum is trusted only for this process. The lock also
+/// prevents separate ModelManager instances from hashing the same file at the
+/// same time during startup.
+private final class ProcessModelValidationCache: @unchecked Sendable {
+    static let shared = ProcessModelValidationCache()
+
+    private let lock = NSLock()
+    private var records: [String: ModelValidationFingerprint] = [:]
+
+    func validateIfNeeded(
+        key: String,
+        fingerprint: ModelValidationFingerprint,
+        validation: () throws -> Void,
+        currentFingerprint: () throws -> ModelValidationFingerprint
+    ) throws {
+        lock.lock()
+        defer { lock.unlock() }
+
+        guard records[key] != fingerprint else {
+            return
+        }
+
+        try validation()
+        guard try currentFingerprint() == fingerprint else {
+            records[key] = nil
+            throw ModelValidationStateError.fileChangedDuringValidation
+        }
+        records[key] = fingerprint
+    }
+
+    func record(key: String, fingerprint: ModelValidationFingerprint) {
+        lock.lock()
+        records[key] = fingerprint
+        lock.unlock()
+    }
+
+    func forget(key: String) {
+        lock.lock()
+        records[key] = nil
+        lock.unlock()
+    }
+}
+
 private final class ModelDownloadDelegate: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
     private let progress: (@Sendable (Double) -> Void)?
     private let lock = NSLock()
     private var continuation: CheckedContinuation<URL, Error>?
     private var temporaryURL: URL?
     private var didResume = false
+    private var isCancelled = false
 
     init(progress: (@Sendable (Double) -> Void)?) {
         self.progress = progress
     }
 
-    func setContinuation(_ continuation: CheckedContinuation<URL, Error>) {
+    func setContinuation(_ continuation: CheckedContinuation<URL, Error>) -> Bool {
         lock.lock()
+        guard !isCancelled else {
+            didResume = true
+            lock.unlock()
+            continuation.resume(throwing: CancellationError())
+            return false
+        }
         self.continuation = continuation
         lock.unlock()
+        return true
+    }
+
+    func cancel() {
+        lock.lock()
+        isCancelled = true
+        let continuation = didResume ? nil : continuation
+        if continuation != nil {
+            didResume = true
+            self.continuation = nil
+        }
+        let url = temporaryURL
+        temporaryURL = nil
+        lock.unlock()
+
+        if let url {
+            try? FileManager.default.removeItem(at: url)
+        }
+        continuation?.resume(throwing: CancellationError())
     }
 
     func urlSession(
@@ -151,6 +234,11 @@ private final class ModelDownloadDelegate: NSObject, URLSessionDownloadDelegate,
                 .appendingPathComponent("CaptionBridgeModel-\(UUID().uuidString).bin")
             try FileManager.default.copyItem(at: location, to: destination)
             lock.lock()
+            if isCancelled {
+                lock.unlock()
+                try? FileManager.default.removeItem(at: destination)
+                return
+            }
             temporaryURL = destination
             lock.unlock()
         } catch {
@@ -219,16 +307,11 @@ private final class ModelDownloadDelegate: NSObject, URLSessionDownloadDelegate,
 }
 
 public actor ModelManager {
-    private struct ValidationRecord: Codable {
-        var size: Int64
-        var modifiedAt: TimeInterval
-        var expectedSHA256: String?
-    }
-
     private let modelsDirectory: URL
     private let descriptors: [ModelDescriptor]
+    private let downloadSessionConfiguration: URLSessionConfiguration
     private var activeDownloads: [String: Task<InstalledModel, Error>] = [:]
-    private var validationCache: [String: ValidationRecord]?
+    private var didRetireLegacyValidationCache = false
 
     public init(
         modelsDirectory: URL = CaptionBridgePaths.modelsURL,
@@ -236,6 +319,17 @@ public actor ModelManager {
     ) {
         self.modelsDirectory = modelsDirectory
         self.descriptors = descriptors
+        downloadSessionConfiguration = .ephemeral
+    }
+
+    init(
+        modelsDirectory: URL,
+        descriptors: [ModelDescriptor],
+        downloadSessionConfiguration: URLSessionConfiguration
+    ) {
+        self.modelsDirectory = modelsDirectory
+        self.descriptors = descriptors
+        self.downloadSessionConfiguration = downloadSessionConfiguration
     }
 
     public nonisolated var availableDescriptors: [ModelDescriptor] {
@@ -255,31 +349,33 @@ public actor ModelManager {
         modelsDirectory.appendingPathComponent(descriptor.fileName)
     }
 
-    /// Returns the installed model, verifying integrity. The expensive
-    /// SHA-256 runs only the first time a given file is seen; afterwards an
-    /// unchanged size + modification date is proof enough, so app launches
-    /// and session starts don't re-hash gigabytes. A file that fails
-    /// verification is deleted so the next download can heal the install.
+    /// Returns the installed model, verifying integrity once per app process.
+    /// Later checks use an in-memory fingerprint; no user-writable persistent
+    /// cache can bypass the first SHA-256 verification after launch. A file
+    /// that fails verification is deleted so the next download can heal the
+    /// install.
     public func installedModel(id: String) throws -> InstalledModel? {
         let descriptor = try descriptor(id: id)
         let url = localURL(for: descriptor)
+        retireLegacyValidationCacheIfNeeded()
         guard FileManager.default.fileExists(atPath: url.path) else {
             return nil
         }
 
-        if isValidatedAndUnchanged(url: url, descriptor: descriptor) {
-            return InstalledModel(descriptor: descriptor, localURL: url)
-        }
-
         do {
-            try validateModel(at: url, descriptor: descriptor)
+            let fingerprint = try validationFingerprint(for: url, descriptor: descriptor)
+            try ProcessModelValidationCache.shared.validateIfNeeded(
+                key: validationCacheKey(for: url),
+                fingerprint: fingerprint,
+                validation: { try validateModel(at: url, descriptor: descriptor) },
+                currentFingerprint: { try validationFingerprint(for: url, descriptor: descriptor) }
+            )
         } catch {
             try? FileManager.default.removeItem(at: url)
             forgetValidation(for: descriptor)
             return nil
         }
 
-        recordValidation(for: url, descriptor: descriptor)
         return InstalledModel(descriptor: descriptor, localURL: url)
     }
 
@@ -344,65 +440,64 @@ public actor ModelManager {
         }
     }
 
-    private var validationCacheURL: URL {
+    private var legacyValidationCacheURL: URL {
         modelsDirectory.appendingPathComponent(".validated-models.json")
     }
 
-    private func loadValidationCache() -> [String: ValidationRecord] {
-        if let validationCache {
-            return validationCache
-        }
-
-        let loaded = (try? Data(contentsOf: validationCacheURL))
-            .flatMap { try? JSONDecoder().decode([String: ValidationRecord].self, from: $0) } ?? [:]
-        validationCache = loaded
-        return loaded
-    }
-
-    private func fileStats(at url: URL, descriptor: ModelDescriptor) -> ValidationRecord? {
-        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path) else {
-            return nil
-        }
-
+    private func validationFingerprint(
+        for url: URL,
+        descriptor: ModelDescriptor
+    ) throws -> ModelValidationFingerprint {
+        let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
         let size = (attributes[.size] as? NSNumber)?.int64Value ?? 0
         let modified = (attributes[.modificationDate] as? Date)?.timeIntervalSinceReferenceDate ?? 0
-        return ValidationRecord(size: size, modifiedAt: modified, expectedSHA256: descriptor.expectedSHA256)
-    }
-
-    private func isValidatedAndUnchanged(url: URL, descriptor: ModelDescriptor) -> Bool {
-        guard let record = loadValidationCache()[descriptor.fileName],
-              let stats = fileStats(at: url, descriptor: descriptor)
-        else {
-            return false
-        }
-
-        // The cache entry is only valid for the checksum it was verified
-        // against; a catalog update re-triggers full verification.
-        return stats.size == record.size
-            && stats.modifiedAt == record.modifiedAt
-            && record.expectedSHA256 == descriptor.expectedSHA256
+        let created = (attributes[.creationDate] as? Date)?.timeIntervalSinceReferenceDate ?? 0
+        let deviceIdentifier = (attributes[.systemNumber] as? NSNumber)?.uint64Value ?? 0
+        let fileIdentifier = (attributes[.systemFileNumber] as? NSNumber)?.uint64Value ?? 0
+        return ModelValidationFingerprint(
+            size: size,
+            modifiedAt: modified,
+            createdAt: created,
+            deviceIdentifier: deviceIdentifier,
+            fileIdentifier: fileIdentifier,
+            expectedSHA256: descriptor.expectedSHA256?.lowercased(),
+            minimumFileSizeBytes: descriptor.minimumFileSizeBytes
+        )
     }
 
     private func recordValidation(for url: URL, descriptor: ModelDescriptor) {
-        guard let stats = fileStats(at: url, descriptor: descriptor) else {
+        guard let fingerprint = try? validationFingerprint(for: url, descriptor: descriptor) else {
             return
         }
-
-        var cache = loadValidationCache()
-        cache[descriptor.fileName] = stats
-        validationCache = cache
-        if let data = try? JSONEncoder().encode(cache) {
-            try? data.write(to: validationCacheURL, options: [.atomic])
-        }
+        ProcessModelValidationCache.shared.record(
+            key: validationCacheKey(for: url),
+            fingerprint: fingerprint
+        )
     }
 
     private func forgetValidation(for descriptor: ModelDescriptor) {
-        var cache = loadValidationCache()
-        cache[descriptor.fileName] = nil
-        validationCache = cache
-        if let data = try? JSONEncoder().encode(cache) {
-            try? data.write(to: validationCacheURL, options: [.atomic])
+        ProcessModelValidationCache.shared.forget(
+            key: validationCacheKey(for: localURL(for: descriptor))
+        )
+    }
+
+    private func validationCacheKey(for url: URL) -> String {
+        url.standardizedFileURL.path
+    }
+
+    private func retireLegacyValidationCacheIfNeeded() {
+        guard !didRetireLegacyValidationCache else {
+            return
         }
+        didRetireLegacyValidationCache = true
+
+        let url = legacyValidationCacheURL
+        guard let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey]),
+              values.isRegularFile == true || values.isSymbolicLink == true
+        else {
+            return
+        }
+        try? FileManager.default.removeItem(at: url)
     }
 
     private func sha256Digest(for url: URL) throws -> String {
@@ -426,15 +521,21 @@ public actor ModelManager {
         progress: (@Sendable (Double) -> Void)?
     ) async throws -> URL {
         let delegate = ModelDownloadDelegate(progress: progress)
-        let session = URLSession(configuration: .ephemeral, delegate: delegate, delegateQueue: nil)
+        let session = URLSession(
+            configuration: downloadSessionConfiguration,
+            delegate: delegate,
+            delegateQueue: nil
+        )
         defer { session.invalidateAndCancel() }
 
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
-                delegate.setContinuation(continuation)
-                session.downloadTask(with: descriptor.downloadURL).resume()
+                if delegate.setContinuation(continuation) {
+                    session.downloadTask(with: descriptor.downloadURL).resume()
+                }
             }
         } onCancel: {
+            delegate.cancel()
             session.invalidateAndCancel()
         }
     }

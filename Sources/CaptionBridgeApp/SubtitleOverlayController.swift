@@ -2,7 +2,7 @@ import AppKit
 import CaptionBridgeCore
 import SwiftUI
 #if canImport(Translation)
-import Translation
+@preconcurrency import Translation
 #endif
 
 @MainActor
@@ -71,6 +71,11 @@ final class SubtitleOverlayController {
         panel.contentView = hostingView
         // Remember where the user left the overlay between launches.
         panel.setFrameAutosaveName("CaptionBridgeOverlay")
+        if panel.frame.height < panel.minSize.height {
+            var frame = panel.frame
+            frame.size.height = panel.minSize.height
+            panel.setFrame(frame, display: false)
+        }
 
         return panel
     }
@@ -121,8 +126,8 @@ final class SubtitleOverlayController {
 
 struct SubtitleOverlayView: View {
     @ObservedObject var viewModel: CaptionBridgeViewModel
-    @State private var pointerInsideHistory = false
     @State private var scrollToLatest = 0
+    @State private var followsLatest = true
 
     var body: some View {
         let metrics = OverlayMetrics(size: viewModel.settings.subtitleOverlaySize)
@@ -140,7 +145,14 @@ struct SubtitleOverlayView: View {
                     .frame(height: 18)
 
                 if hasCaptionContent {
-                    scrollableCaptionHistory(metrics: metrics)
+                    VStack(alignment: .leading, spacing: 7) {
+                        scrollableFinalHistory(metrics: metrics)
+
+                        Divider()
+                            .overlay(.white.opacity(0.12))
+
+                        liveDraftArea(metrics: metrics)
+                    }
                 } else {
                     Text(displayText)
                         .font(.system(size: metrics.statusFontSize, weight: .semibold))
@@ -150,22 +162,25 @@ struct SubtitleOverlayView: View {
                         .lineLimit(2)
                         .minimumScaleFactor(0.7)
                         .accessibilityLabel(displayText)
+                        .accessibilityAddTraits(.updatesFrequently)
                 }
             }
             .padding(.horizontal, metrics.horizontalPadding)
             .padding(.bottom, metrics.bottomPadding)
             .background(instantDraftTranslationBridge)
 
-            if hasCaptionContent {
+            if !overlayFinals.isEmpty, !followsLatest {
                 Button {
+                    followsLatest = true
                     scrollToLatest += 1
                 } label: {
                     Image(systemName: "arrow.down.circle.fill")
                         .font(.system(size: 21, weight: .semibold))
-                        .foregroundStyle(.white.opacity(pointerInsideHistory ? 0.9 : 0.5))
+                        .foregroundStyle(.white.opacity(0.9))
                         .shadow(radius: 2)
                 }
                 .buttonStyle(.plain)
+                .accessibilityLabel("Jump to latest captions")
                 .padding(.top, 28)
                 .padding(.trailing, 18)
                 .help("Jump to latest captions")
@@ -182,9 +197,9 @@ struct SubtitleOverlayView: View {
         #endif
     }
 
-    private func scrollableCaptionHistory(metrics: OverlayMetrics) -> some View {
+    private func scrollableFinalHistory(metrics: OverlayMetrics) -> some View {
         ScrollViewReader { proxy in
-            ScrollView {
+            let historyScrollView = ScrollView {
                 LazyVStack(alignment: .leading, spacing: metrics.rowSpacing) {
                     ForEach(Array(overlayFinals.enumerated()), id: \.element.id) { index, item in
                         let isLatestFinal = index == overlayFinals.count - 1
@@ -197,43 +212,31 @@ struct SubtitleOverlayView: View {
                         )
                     }
 
-                    if hasDraftContent {
-                        captionRow(
-                            text: viewModel.draftSubtitle,
-                            sourceText: viewModel.draftSourceText,
-                            isLatestFinal: false,
-                            opacity: 0.72,
-                            isDraft: true,
-                            metrics: metrics
-                        )
-                    }
-
                     Color.clear
                         .frame(height: 1)
                         .id("latest-caption-anchor")
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
+                .background(
+                    HistoryScrollObserver { isAtLatest in
+                        followsLatest = isAtLatest
+                    }
+                )
             }
             .scrollIndicators(.visible)
-            .defaultScrollAnchor(.bottom)
-            .onHover { pointerInsideHistory = $0 }
+
+            trackHistoryPosition(historyScrollView)
             .onAppear {
                 scrollToLatestCaption(proxy)
             }
             .onChange(of: viewModel.sessionTranscript.count) {
-                guard !pointerInsideHistory else {
+                guard followsLatest else {
                     return
                 }
                 scrollToLatestCaption(proxy)
             }
-            .onChange(of: viewModel.draftSubtitle) {
-                guard !pointerInsideHistory else {
-                    return
-                }
-                scrollToLatestCaption(proxy)
-            }
-            .onChange(of: viewModel.draftSourceText) {
-                guard !pointerInsideHistory else {
+            .onChange(of: viewModel.subtitleHistory.count) {
+                guard viewModel.sessionTranscript.isEmpty, followsLatest else {
                     return
                 }
                 scrollToLatestCaption(proxy)
@@ -242,6 +245,58 @@ struct SubtitleOverlayView: View {
                 scrollToLatestCaption(proxy)
             }
         }
+    }
+
+    @ViewBuilder
+    private func trackHistoryPosition<Content: View>(_ content: Content) -> some View {
+        if #available(macOS 15.0, *) {
+            content.onScrollGeometryChange(for: Bool.self) { geometry in
+                geometry.contentSize.height <= geometry.containerSize.height + 8
+                    || geometry.visibleRect.maxY >= geometry.contentSize.height - 8
+            } action: { _, isAtLatest in
+                followsLatest = isAtLatest
+            }
+        } else {
+            content
+        }
+    }
+
+    private func liveDraftArea(metrics: OverlayMetrics) -> some View {
+        let sourceText = viewModel.settings.subtitleDisplayMode == .bilingual
+            ? (viewModel.draftSourceText ?? "")
+            : ""
+        let translatedText = viewModel.draftSubtitle
+        let isBilingual = viewModel.settings.subtitleDisplayMode == .bilingual
+        let bilingualRowHeight = (metrics.draftAreaHeight - 4) / 2
+
+        return VStack(alignment: .leading, spacing: 4) {
+            if isBilingual {
+                Text(sourceText)
+                    .font(.system(size: metrics.sourceDraftOnlyFontSize, weight: .medium))
+                    .foregroundStyle(.white.opacity(0.72))
+                    .lineLimit(metrics.draftSourceLineLimit)
+                    .lineSpacing(2)
+                    .minimumScaleFactor(0.72)
+                    .frame(maxWidth: .infinity, minHeight: bilingualRowHeight, maxHeight: bilingualRowHeight, alignment: .topLeading)
+            }
+
+            Text(translatedText)
+                .font(.system(size: metrics.draftFontSize, weight: .regular))
+                .foregroundStyle(.white.opacity(0.82))
+                .lineLimit(metrics.draftLineLimit)
+                .lineSpacing(3)
+                .minimumScaleFactor(0.75)
+                .frame(
+                    maxWidth: .infinity,
+                    minHeight: isBilingual ? bilingualRowHeight : metrics.draftAreaHeight,
+                    maxHeight: isBilingual ? bilingualRowHeight : metrics.draftAreaHeight,
+                    alignment: .topLeading
+                )
+        }
+        .frame(height: metrics.draftAreaHeight, alignment: .top)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(draftAccessibilityLabel)
+        .accessibilityAddTraits(.updatesFrequently)
     }
 
     private func captionRow(
@@ -296,15 +351,20 @@ struct SubtitleOverlayView: View {
     }
 
     private var hasDraftContent: Bool {
+        !viewModel.draftSubtitle.isEmpty || !(viewModel.draftSourceText?.isEmpty ?? true)
+    }
+
+    private var draftAccessibilityLabel: String {
+        var lines: [String] = []
+        if viewModel.settings.subtitleDisplayMode == .bilingual,
+           let sourceText = viewModel.draftSourceText,
+           !sourceText.isEmpty {
+            lines.append("French: \(sourceText)")
+        }
         if !viewModel.draftSubtitle.isEmpty {
-            return true
+            lines.append("English: \(viewModel.draftSubtitle)")
         }
-
-        guard viewModel.settings.subtitleDisplayMode == .bilingual else {
-            return false
-        }
-
-        return !(viewModel.draftSourceText?.isEmpty ?? true)
+        return lines.isEmpty ? "Live caption waiting" : lines.joined(separator: ". ")
     }
 
     private func opacity(for index: Int, totalCount: Int) -> Double {
@@ -317,9 +377,9 @@ struct SubtitleOverlayView: View {
         case 0:
             return 1
         case 1:
-            return 0.82
+            return 0.9
         default:
-            return 0.64
+            return 0.78
         }
     }
 
@@ -349,7 +409,9 @@ struct SubtitleOverlayView: View {
 
     private func scrollToLatestCaption(_ proxy: ScrollViewProxy) {
         DispatchQueue.main.async {
-            withAnimation(.easeOut(duration: 0.18)) {
+            var transaction = Transaction()
+            transaction.disablesAnimations = true
+            withTransaction(transaction) {
                 proxy.scrollTo("latest-caption-anchor", anchor: .bottom)
             }
         }
@@ -369,6 +431,120 @@ struct SubtitleOverlayView: View {
         }
 
         return isLatestFinal ? metrics.latestSourceLineLimit : metrics.previousSourceLineLimit
+    }
+}
+
+private struct HistoryScrollObserver: NSViewRepresentable {
+    let onUserScroll: (Bool) -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(onUserScroll: onUserScroll)
+    }
+
+    func makeNSView(context: Context) -> ProbeView {
+        let view = ProbeView()
+        view.observer = context.coordinator
+        view.connectToScrollView()
+        return view
+    }
+
+    func updateNSView(_ nsView: ProbeView, context: Context) {
+        context.coordinator.onUserScroll = onUserScroll
+        nsView.observer = context.coordinator
+        nsView.connectToScrollView()
+    }
+
+    static func dismantleNSView(_ nsView: ProbeView, coordinator: Coordinator) {
+        coordinator.detach()
+    }
+
+    @MainActor
+    final class Coordinator: NSObject {
+        var onUserScroll: (Bool) -> Void
+        private weak var scrollView: NSScrollView?
+
+        init(onUserScroll: @escaping (Bool) -> Void) {
+            self.onUserScroll = onUserScroll
+        }
+
+        func attach(to scrollView: NSScrollView?) {
+            guard self.scrollView !== scrollView else {
+                return
+            }
+
+            detach()
+            self.scrollView = scrollView
+            guard let scrollView else {
+                return
+            }
+
+            let center = NotificationCenter.default
+            for name in [NSScrollView.didLiveScrollNotification, NSScrollView.didEndLiveScrollNotification] {
+                center.addObserver(
+                    self,
+                    selector: #selector(handleScrollNotification),
+                    name: name,
+                    object: scrollView
+                )
+            }
+            scrollView.contentView.postsBoundsChangedNotifications = true
+            center.addObserver(
+                self,
+                selector: #selector(handleScrollNotification),
+                name: NSView.boundsDidChangeNotification,
+                object: scrollView.contentView
+            )
+            reportPosition()
+        }
+
+        func detach() {
+            NotificationCenter.default.removeObserver(self)
+            scrollView = nil
+        }
+
+        @objc private func handleScrollNotification(_ notification: Notification) {
+            reportPosition()
+        }
+
+        private func reportPosition() {
+            guard let scrollView, let documentView = scrollView.documentView else {
+                return
+            }
+
+            let visibleRect = scrollView.contentView.documentVisibleRect
+            let documentBounds = documentView.bounds
+            let tolerance: CGFloat = 8
+            let isAtLatest: Bool
+            if documentBounds.height <= visibleRect.height + tolerance {
+                isAtLatest = true
+            } else if let verticalScroller = scrollView.verticalScroller {
+                isAtLatest = verticalScroller.doubleValue >= 0.99
+            } else if documentView.isFlipped {
+                isAtLatest = visibleRect.maxY >= documentBounds.maxY - tolerance
+            } else {
+                isAtLatest = visibleRect.minY <= documentBounds.minY + tolerance
+            }
+            onUserScroll(isAtLatest)
+        }
+    }
+
+    @MainActor
+    final class ProbeView: NSView {
+        weak var observer: Coordinator?
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            connectToScrollView()
+        }
+
+        func connectToScrollView() {
+            DispatchQueue.main.async { [weak self] in
+                guard let self else {
+                    return
+                }
+                observer?.attach(to: enclosingScrollView)
+            }
+        }
     }
 }
 
@@ -393,42 +569,44 @@ private struct OverlayMetrics {
     let latestSourceLineLimit: Int
     let previousSourceLineLimit: Int
     let draftSourceLineLimit: Int
+    let draftAreaHeight: CGFloat
 
     init(size: CaptionBridgeCore.SubtitleOverlaySize) {
         switch size {
         case .compact:
             defaultWidth = 740
-            defaultHeight = 275
+            defaultHeight = 350
             minimumWidth = 560
-            minimumHeight = 205
-            latestFinalFontSize = 23
-            previousFinalFontSize = 18
-            draftFontSize = 19
-            latestSourceFontSize = 16
-            previousSourceFontSize = 14
-            sourceDraftOnlyFontSize = 18
-            statusFontSize = 23
+            minimumHeight = 330
+            latestFinalFontSize = 17
+            previousFinalFontSize = 16
+            draftFontSize = 16
+            latestSourceFontSize = 13
+            previousSourceFontSize = 12
+            sourceDraftOnlyFontSize = 14
+            statusFontSize = 20
             horizontalPadding = 22
             bottomPadding = 18
             rowSpacing = 7
-            latestFinalLineLimit = 3
+            latestFinalLineLimit = 2
             previousFinalLineLimit = 2
             draftLineLimit = 2
             latestSourceLineLimit = 2
             previousSourceLineLimit = 2
             draftSourceLineLimit = 2
+            draftAreaHeight = 78
         case .comfortable:
             defaultWidth = 860
-            defaultHeight = 340
+            defaultHeight = 390
             minimumWidth = 620
-            minimumHeight = 250
-            latestFinalFontSize = 25
-            previousFinalFontSize = 21
-            draftFontSize = 22
-            latestSourceFontSize = 18
-            previousSourceFontSize = 16
-            sourceDraftOnlyFontSize = 21
-            statusFontSize = 26
+            minimumHeight = 340
+            latestFinalFontSize = 19
+            previousFinalFontSize = 17
+            draftFontSize = 18
+            latestSourceFontSize = 15
+            previousSourceFontSize = 13
+            sourceDraftOnlyFontSize = 16
+            statusFontSize = 23
             horizontalPadding = 26
             bottomPadding = 22
             rowSpacing = 9
@@ -438,18 +616,19 @@ private struct OverlayMetrics {
             latestSourceLineLimit = 2
             previousSourceLineLimit = 2
             draftSourceLineLimit = 2
+            draftAreaHeight = 84
         case .large:
             defaultWidth = 980
-            defaultHeight = 410
+            defaultHeight = 460
             minimumWidth = 700
-            minimumHeight = 300
-            latestFinalFontSize = 29
-            previousFinalFontSize = 24
-            draftFontSize = 25
-            latestSourceFontSize = 21
-            previousSourceFontSize = 18
-            sourceDraftOnlyFontSize = 24
-            statusFontSize = 29
+            minimumHeight = 390
+            latestFinalFontSize = 22
+            previousFinalFontSize = 19
+            draftFontSize = 20
+            latestSourceFontSize = 17
+            previousSourceFontSize = 15
+            sourceDraftOnlyFontSize = 18
+            statusFontSize = 26
             horizontalPadding = 30
             bottomPadding = 26
             rowSpacing = 10
@@ -459,6 +638,7 @@ private struct OverlayMetrics {
             latestSourceLineLimit = 2
             previousSourceLineLimit = 2
             draftSourceLineLimit = 2
+            draftAreaHeight = 96
         }
     }
 }

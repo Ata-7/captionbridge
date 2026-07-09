@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.2.2 — 2026-07-09
+
+Readability and reliability follow-up after sustained live-meeting testing:
+
+- **Stable overlay:** completed captions now live in their own scrollable history while the changing live draft stays in a fixed-height area. Draft updates no longer resize rows, animate the history, or force the reader back to the newest line.
+- **Calmer live text:** French draft replacements are coalesced to at most one visible change every 0.8 seconds, and only visible drafts are sent through instant English translation.
+- **Cleaner continuous speech:** forced finals wait briefly for a word gap, retain a firm latency ceiling, and reject runaway phrase loops and common Whisper filler captions.
+- **Matched bilingual finals:** the fast single-pass final is used only when the accepted French draft's exact audio range covers the utterance; otherwise both lines are generated from the same complete audio.
+- **Clean session boundaries:** microphone lifecycle operations are serialized, and pausing or stopping atomically rejects queued and late audio from the previous session.
+- **Self-healing inference:** queued helper requests receive their own timeout when they begin processing, and the repeating watchdog terminates a helper that stops making progress.
+- **Reliable model lifecycle:** model selection and download results cannot race newer choices, cancellation stops the transfer, and installed files are checksum-verified once per process without trusting user-writable validation metadata.
+- Repeated sentences from distinct audio ranges are preserved instead of being mistaken for duplicate events.
+- License notices are bundled in both the app and DMG, and the release script supports opt-in Developer ID notarization and stapling.
+
 ## 0.2.1 — 2026-07-09
 
 Fixes from an independent post-release review (OpenAI Codex reviewing the 0.2.0 changes):
@@ -13,7 +27,7 @@ Fixes from an independent post-release review (OpenAI Codex reviewing the 0.2.0 
 - Turning "Instant English drafts" off also prevents the Apple language-pack preparation, not just translation.
 - Model validation cache entries are bound to the expected checksum, so a future catalog update re-verifies files.
 - Packaging applies hardened runtime + secure timestamp automatically when a real signing identity is provided (notarization-ready with a Developer ID).
-- Added THIRD-PARTY-NOTICES.md covering bundled whisper.cpp/ggml and the Whisper models.
+- Added `THIRD-PARTY-NOTICES.md` covering bundled whisper.cpp/ggml and the Whisper models.
 
 ## 0.2.0 — 2026-07-09
 

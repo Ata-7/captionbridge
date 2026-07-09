@@ -3,8 +3,36 @@ import CaptionBridgeCore
 import Foundation
 import SwiftUI
 #if canImport(Translation)
-import Translation
+@preconcurrency import Translation
 #endif
+
+private struct EpochAudioChunk: Sendable {
+    let chunk: PCMAudioChunk
+    let epoch: Int
+}
+
+private final class AudioChunkEpochGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var acceptingEpoch: Int?
+
+    func open(epoch: Int) {
+        lock.withLock {
+            acceptingEpoch = epoch
+        }
+    }
+
+    func close() {
+        lock.withLock {
+            acceptingEpoch = nil
+        }
+    }
+
+    func tag(_ chunk: PCMAudioChunk) -> EpochAudioChunk? {
+        lock.withLock {
+            acceptingEpoch.map { EpochAudioChunk(chunk: chunk, epoch: $0) }
+        }
+    }
+}
 
 @MainActor
 final class CaptionBridgeViewModel: ObservableObject {
@@ -54,6 +82,7 @@ final class CaptionBridgeViewModel: ObservableObject {
     @Published var modelDownloadProgress: Double?
     @Published var liveStatus = "Idle"
     @Published var canOpenPrivacySettings = false
+    @Published private(set) var isPauseTransitionPending = false
 
     let modelDescriptors = ModelDescriptor.builtIn
     weak var overlayController: SubtitleOverlayController?
@@ -67,12 +96,14 @@ final class CaptionBridgeViewModel: ObservableObject {
     private var installedModel: InstalledModel?
     private var activeCapture: (any AudioCaptureService)?
     private var modelDownloadTask: Task<Void, Never>?
+    private var pipelineResetTask: Task<Void, Never>?
     private var isPaused = false
     private var diagnosticLogURL: URL?
     private var diagnosticHandle: FileHandle?
     private var didConfigureLaunchDiagnostics = false
     private var receivedChunkCount = 0
     private var sessionEpoch = 0
+    private var modelDownloadGeneration = 0
     private var didAttemptCaptureRestart = false
     private var lastDiagnosticStatus: String?
     private var lastDiagnosticOverlayText: String?
@@ -82,31 +113,43 @@ final class CaptionBridgeViewModel: ObservableObject {
     // Audio chunks and caption events each flow through a single ordered
     // stream: unstructured per-callback Tasks would not preserve order, and
     // out-of-order audio garbles transcription.
-    private let chunkStream: AsyncStream<PCMAudioChunk>
-    private let chunkContinuation: AsyncStream<PCMAudioChunk>.Continuation
+    private let audioChunkGate = AudioChunkEpochGate()
+    private let chunkStream: AsyncStream<EpochAudioChunk>
+    private let chunkContinuation: AsyncStream<EpochAudioChunk>.Continuation
     private let signalStream: AsyncStream<CoordinatorSignal>
     private let signalContinuation: AsyncStream<CoordinatorSignal>.Continuation
     private var pipelineTasks: [Task<Void, Never>] = []
 
     // French drafts queued for on-device English translation (macOS 15+).
     private var frenchDraftContinuation: AsyncStream<String>.Continuation?
+    private var pendingSourceDraft: String?
+    private var draftReplacementTask: Task<Void, Never>?
+    private var lastDraftPresentationDate = Date.distantPast
 
     private static let diagnosticTimestampFormatter = ISO8601DateFormatter()
+    private static let draftReplacementInterval: TimeInterval = 0.8
 
     init() {
         coordinator = LiveSubtitleCoordinator(engine: engine)
         (chunkStream, chunkContinuation) = AsyncStream.makeStream(
-            of: PCMAudioChunk.self,
+            of: EpochAudioChunk.self,
             bufferingPolicy: .bufferingNewest(256)
         )
         (signalStream, signalContinuation) = AsyncStream.makeStream(of: CoordinatorSignal.self)
 
         let chunkContinuation = chunkContinuation
+        let audioChunkGate = audioChunkGate
         systemCapture.onChunk = { chunk in
-            chunkContinuation.yield(chunk)
+            guard let taggedChunk = audioChunkGate.tag(chunk) else {
+                return
+            }
+            chunkContinuation.yield(taggedChunk)
         }
         microphoneCapture.onChunk = { chunk in
-            chunkContinuation.yield(chunk)
+            guard let taggedChunk = audioChunkGate.tag(chunk) else {
+                return
+            }
+            chunkContinuation.yield(taggedChunk)
         }
         systemCapture.onStopped = { [weak self] error in
             Task { @MainActor in
@@ -123,11 +166,11 @@ final class CaptionBridgeViewModel: ObservableObject {
             guard let stream = self?.chunkStream else {
                 return
             }
-            for await chunk in stream {
+            for await taggedChunk in stream {
                 guard let self else {
                     return
                 }
-                await self.processChunk(chunk)
+                await self.processChunk(taggedChunk)
             }
         })
 
@@ -150,6 +193,9 @@ final class CaptionBridgeViewModel: ObservableObject {
 
     deinit {
         pipelineTasks.forEach { $0.cancel() }
+        draftReplacementTask?.cancel()
+        modelDownloadTask?.cancel()
+        audioChunkGate.close()
         chunkContinuation.finish()
         signalContinuation.finish()
     }
@@ -208,18 +254,31 @@ final class CaptionBridgeViewModel: ObservableObject {
     }
 
     func refreshModelStatus() async {
+        let modelID = settings.selectedModelID
         do {
-            if let model = try await modelManager.installedModel(id: settings.selectedModelID) {
+            if let model = try await modelManager.installedModel(id: modelID) {
+                guard settings.selectedModelID == modelID else {
+                    return
+                }
                 installedModel = model
                 isSelectedModelInstalled = true
                 modelStatus = "\(model.descriptor.displayName) is installed"
             } else {
+                guard settings.selectedModelID == modelID else {
+                    return
+                }
                 installedModel = nil
                 isSelectedModelInstalled = false
-                let descriptor = try await modelManager.descriptor(id: settings.selectedModelID)
+                let descriptor = try await modelManager.descriptor(id: modelID)
+                guard settings.selectedModelID == modelID else {
+                    return
+                }
                 modelStatus = "\(descriptor.displayName) needs download"
             }
         } catch {
+            guard settings.selectedModelID == modelID else {
+                return
+            }
             installedModel = nil
             isSelectedModelInstalled = false
             modelStatus = error.localizedDescription
@@ -260,6 +319,8 @@ final class CaptionBridgeViewModel: ObservableObject {
             return
         }
 
+        modelDownloadGeneration += 1
+        let generation = modelDownloadGeneration
         modelDownloadProgress = 0
         modelStatus = "Downloading local translation model..."
         let modelID = settings.selectedModelID
@@ -268,17 +329,33 @@ final class CaptionBridgeViewModel: ObservableObject {
             do {
                 let model = try await modelManager.ensureInstalled(id: modelID) { [weak self] progress in
                     Task { @MainActor in
-                        self?.modelDownloadProgress = progress
+                        guard let self,
+                              self.modelDownloadGeneration == generation,
+                              self.settings.selectedModelID == modelID
+                        else {
+                            return
+                        }
+                        self.modelDownloadProgress = progress
                     }
                 }
                 guard !Task.isCancelled else {
                     throw CancellationError()
+                }
+                guard modelDownloadGeneration == generation,
+                      settings.selectedModelID == modelID
+                else {
+                    return
                 }
                 installedModel = model
                 isSelectedModelInstalled = true
                 modelStatus = "\(model.descriptor.displayName) is installed"
                 modelDownloadProgress = nil
             } catch {
+                guard modelDownloadGeneration == generation,
+                      settings.selectedModelID == modelID
+                else {
+                    return
+                }
                 isSelectedModelInstalled = false
                 modelDownloadProgress = nil
                 if error is CancellationError || (error as? URLError)?.code == .cancelled {
@@ -291,11 +368,14 @@ final class CaptionBridgeViewModel: ObservableObject {
                     lastError = error.localizedDescription
                 }
             }
-            modelDownloadTask = nil
+            if modelDownloadGeneration == generation {
+                modelDownloadTask = nil
+            }
         }
     }
 
     func cancelModelDownload() {
+        modelDownloadGeneration += 1
         modelDownloadTask?.cancel()
         modelDownloadTask = nil
         modelDownloadProgress = nil
@@ -307,18 +387,30 @@ final class CaptionBridgeViewModel: ObservableObject {
             return
         }
 
+        audioChunkGate.close()
+        sessionEpoch += 1
+        let epoch = sessionEpoch
+        let precedingReset = pipelineResetTask
         sessionState = .preparing
         Task {
             lastError = nil
             canOpenPrivacySettings = false
             receivedChunkCount = 0
-            sessionEpoch += 1
             didAttemptCaptureRestart = false
             updateLiveStatus("Preparing local captioning...")
             isPaused = false
+            isPauseTransitionPending = false
+
+            await precedingReset?.value
+            guard sessionEpoch == epoch, sessionState == .preparing else {
+                return
+            }
 
             await refreshModelStatus()
             refreshHelperStatus()
+            guard sessionEpoch == epoch, sessionState == .preparing else {
+                return
+            }
             guard let model = installedModel else {
                 sessionState = .failed("Download a local model before starting subtitles.")
                 updateLiveStatus("Model needed")
@@ -335,25 +427,41 @@ final class CaptionBridgeViewModel: ObservableObject {
             // meeting doesn't pay the multi-second cold start.
             updateLiveStatus("Loading the translation model into memory...")
             let warmedUp = await engine.warmUp(model: model, languagePair: settings.languagePair)
+            guard sessionEpoch == epoch, sessionState == .preparing else {
+                return
+            }
             if !warmedUp {
                 refreshHelperStatus()
-                guard isLocalTranslatorReady else {
-                    sessionState = .failed("Reinstall CaptionBridge from the DMG so the local translator is included.")
-                    updateLiveStatus("Local translator needed")
-                    return
-                }
+                let message = isLocalTranslatorReady
+                    ? "The local translator could not load the selected model. Restart CaptionBridge or reinstall the app if the problem continues."
+                    : "Reinstall CaptionBridge from the DMG so the local translator is included."
+                sessionState = .failed(message)
+                lastError = message
+                updateLiveStatus("Local translator could not start")
+                return
             }
 
             do {
                 let capture: any AudioCaptureService = settings.audioSource == .microphone ? microphoneCapture : systemCapture
                 activeCapture = capture
+                audioChunkGate.open(epoch: epoch)
                 try await capture.start(source: settings.audioSource)
+                guard sessionEpoch == epoch, sessionState == .preparing else {
+                    audioChunkGate.close()
+                    await capture.stop()
+                    return
+                }
                 overlayController?.show()
                 isOverlayVisible = true
                 sessionState = .running
                 updateLiveStatus(listeningStatus)
-                scheduleNoAudioCheck(epoch: sessionEpoch)
+                scheduleNoAudioCheck(epoch: epoch)
             } catch {
+                audioChunkGate.close()
+                activeCapture = nil
+                guard sessionEpoch == epoch, sessionState == .preparing else {
+                    return
+                }
                 let message = friendlyMessage(for: error)
                 sessionState = .failed(message)
                 lastError = message
@@ -367,44 +475,66 @@ final class CaptionBridgeViewModel: ObservableObject {
     func pauseOrResume() {
         switch sessionState {
         case .running:
+            audioChunkGate.close()
+            sessionEpoch += 1
             isPaused = true
             sessionState = .paused
-            // Invalidate captions still in flight; they belong to pre-pause audio.
-            sessionEpoch += 1
-            draftSubtitle = ""
-            draftSourceText = nil
-        case .paused:
-            isPaused = false
-            sessionState = .running
-            // Drop audio buffered before the pause so a stale half-sentence
-            // is not finalized minutes later.
-            Task {
+            isPauseTransitionPending = false
+            clearLiveDraft()
+            updateLiveStatus("Paused")
+
+            let resetTask = Task { [coordinator] in
                 await coordinator.resetSpeechTracking()
             }
-            updateLiveStatus(listeningStatus)
+            pipelineResetTask = resetTask
+        case .paused:
+            guard !isPauseTransitionPending else {
+                return
+            }
+
+            isPauseTransitionPending = true
+            let epoch = sessionEpoch
+            let resetTask = pipelineResetTask
+            Task {
+                await resetTask?.value
+                guard sessionEpoch == epoch, sessionState == .paused else {
+                    return
+                }
+
+                audioChunkGate.open(epoch: epoch)
+                isPaused = false
+                isPauseTransitionPending = false
+                sessionState = .running
+                updateLiveStatus(listeningStatus)
+            }
         default:
             break
         }
     }
 
     func stopSubtitles() {
-        Task {
-            sessionEpoch += 1
-            await activeCapture?.stop()
-            activeCapture = nil
-            isPaused = false
-            sessionState = .idle
-            canOpenPrivacySettings = false
-            updateLiveStatus("Idle")
-            draftSubtitle = ""
-            draftSourceText = nil
-            recordOverlayDisplayIfChanged()
+        audioChunkGate.close()
+        sessionEpoch += 1
+        let capture = activeCapture
+        activeCapture = nil
+        isPaused = false
+        isPauseTransitionPending = false
+        sessionState = .idle
+        canOpenPrivacySettings = false
+        updateLiveStatus("Idle")
+        clearLiveDraft()
+        recordOverlayDisplayIfChanged()
+
+        let resetTask = Task { [coordinator] in
+            await capture?.stop()
             await coordinator.resetSpeechTracking()
         }
+        pipelineResetTask = resetTask
     }
 
     func clearCaptions() {
         let epoch = sessionEpoch
+        clearLiveDraft()
         if sessionState.isRunning {
             updateLiveStatus(listeningStatus)
         }
@@ -434,11 +564,15 @@ final class CaptionBridgeViewModel: ObservableObject {
         }
     }
 
-    private func processChunk(_ chunk: PCMAudioChunk) async {
-        guard !isPaused, sessionState.isRunning else {
+    private func processChunk(_ taggedChunk: EpochAudioChunk) async {
+        guard taggedChunk.epoch == sessionEpoch,
+              !isPaused,
+              sessionState.isRunning
+        else {
             return
         }
 
+        let chunk = taggedChunk.chunk
         guard !chunk.samples.isEmpty else {
             return
         }
@@ -449,15 +583,14 @@ final class CaptionBridgeViewModel: ObservableObject {
             recordDiagnostic("audio chunk \(receivedChunkCount): samples=\(chunk.samples.count) rms=\(rms)")
         }
 
-        let epoch = sessionEpoch
         await coordinator.handle(
             chunk: chunk,
             model: installedModel,
             languagePair: settings.languagePair
         ) { [signalContinuation] event in
-            signalContinuation.yield(.event(event, epoch: epoch))
+            signalContinuation.yield(.event(event, epoch: taggedChunk.epoch))
         } status: { [signalContinuation] message in
-            signalContinuation.yield(.status(message, epoch: epoch))
+            signalContinuation.yield(.status(message, epoch: taggedChunk.epoch))
         }
     }
 
@@ -494,21 +627,18 @@ final class CaptionBridgeViewModel: ObservableObject {
         case .final:
             appendFinalCaption(event)
             currentSourceText = event.sourceText
-            draftSubtitle = ""
-            draftSourceText = nil
+            clearLiveDraft()
             recordDiagnostic("final: \(event.text)")
             updateLiveStatus("Caption updated")
         case .speechStarted:
             currentSourceText = nil
-            draftSubtitle = ""
-            draftSourceText = nil
+            clearLiveDraft()
             recordDiagnostic("speech started")
             updateLiveStatus("Listening to the next sentence...")
         case .cleared:
             currentSubtitle = ""
             currentSourceText = nil
-            draftSubtitle = ""
-            draftSourceText = nil
+            clearLiveDraft()
             subtitleHistoryBuffer.clear()
             subtitleHistory = subtitleHistoryBuffer.items
             sessionTranscriptBuffer.clear()
@@ -538,17 +668,69 @@ final class CaptionBridgeViewModel: ObservableObject {
             return
         }
 
-        if draftSourceText != normalized {
-            // The English line must never describe an older French line.
-            draftSubtitle = ""
+        guard draftSourceText != normalized else {
+            pendingSourceDraft = nil
+            draftReplacementTask?.cancel()
+            draftReplacementTask = nil
+            return
         }
+
+        guard !(draftSourceText?.isEmpty ?? true) else {
+            publishSourceDraft(normalized)
+            return
+        }
+
+        pendingSourceDraft = normalized
+        let elapsed = Date().timeIntervalSince(lastDraftPresentationDate)
+        guard elapsed < Self.draftReplacementInterval else {
+            pendingSourceDraft = nil
+            draftReplacementTask?.cancel()
+            draftReplacementTask = nil
+            publishSourceDraft(normalized)
+            return
+        }
+
+        guard draftReplacementTask == nil else {
+            return
+        }
+
+        let delay = Self.draftReplacementInterval - elapsed
+        draftReplacementTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            guard !Task.isCancelled, let self else {
+                return
+            }
+
+            draftReplacementTask = nil
+            guard let pendingSourceDraft else {
+                return
+            }
+            self.pendingSourceDraft = nil
+            publishSourceDraft(pendingSourceDraft)
+        }
+    }
+
+    private func publishSourceDraft(_ normalized: String) {
+        // Clear English in the same main-actor turn that French changes. The
+        // overlay reserves both rows, so this never shifts the layout.
+        draftSubtitle = ""
         draftSourceText = normalized
+        lastDraftPresentationDate = Date()
         recordDiagnostic("source draft: \(normalized)")
         updateLiveStatus("French caption ready")
 
         if supportsInstantEnglishDrafts, settings.instantEnglishDraftsEnabled {
             frenchDraftContinuation?.yield(normalized)
         }
+    }
+
+    private func clearLiveDraft() {
+        draftReplacementTask?.cancel()
+        draftReplacementTask = nil
+        pendingSourceDraft = nil
+        lastDraftPresentationDate = .distantPast
+        draftSubtitle = ""
+        draftSourceText = nil
     }
 
     private func handleCaptureStopped(_ error: Error?) {
@@ -560,6 +742,12 @@ final class CaptionBridgeViewModel: ObservableObject {
 
         guard !didAttemptCaptureRestart, let capture = activeCapture else {
             let message = error.map(friendlyMessage(for:)) ?? "Audio capture stopped unexpectedly."
+            audioChunkGate.close()
+            sessionEpoch += 1
+            activeCapture = nil
+            isPaused = false
+            isPauseTransitionPending = false
+            clearLiveDraft()
             sessionState = .failed(message)
             lastError = message
             canOpenPrivacySettings = error.map(isPrivacyPermissionError) ?? false
@@ -576,10 +764,17 @@ final class CaptionBridgeViewModel: ObservableObject {
             }
             do {
                 try await capture.start(source: settings.audioSource)
-                updateLiveStatus(listeningStatus)
+                didAttemptCaptureRestart = false
+                updateLiveStatus(sessionState == .paused ? "Paused" : listeningStatus)
                 recordDiagnostic("capture restarted")
             } catch {
                 let message = friendlyMessage(for: error)
+                audioChunkGate.close()
+                sessionEpoch += 1
+                activeCapture = nil
+                isPaused = false
+                isPauseTransitionPending = false
+                clearLiveDraft()
                 sessionState = .failed(message)
                 lastError = message
                 canOpenPrivacySettings = isPrivacyPermissionError(error)

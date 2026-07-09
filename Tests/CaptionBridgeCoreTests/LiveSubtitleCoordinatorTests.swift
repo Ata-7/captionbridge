@@ -286,6 +286,39 @@ final class LiveSubtitleCoordinatorTests: XCTestCase {
         XCTAssertFalse(events.values.contains { $0.kind == .final })
     }
 
+    func testVeryShortUncorroboratedBilingualFinalIsSuppressed() async {
+        let engine = StubSpeechTranslationEngine(
+            result: SpeechTranslationResult(
+                text: "I'm sorry",
+                sourceText: "Bonne nuit",
+                isFinal: true
+            )
+        )
+        let coordinator = makeCoordinator(engine: engine)
+        let events = CaptionEventRecorder()
+        let model = testModel()
+
+        for index in 0..<6 {
+            await coordinator.handle(
+                chunk: chunk(amplitude: 0.05, index: index),
+                model: model,
+                languagePair: .frenchToEnglish,
+                emit: { events.append($0) }
+            )
+        }
+
+        for index in 6..<18 {
+            await coordinator.handle(
+                chunk: chunk(amplitude: 0, index: index),
+                model: model,
+                languagePair: .frenchToEnglish,
+                emit: { events.append($0) }
+            )
+        }
+
+        XCTAssertFalse(events.values.contains { $0.kind == .final })
+    }
+
     func testForcedContinuousFinalsShowContinuation() async {
         let engine = SequencedSpeechTranslationEngine(
             outcomes: [
@@ -344,6 +377,61 @@ final class LiveSubtitleCoordinatorTests: XCTestCase {
             "The team can finish the preparation...",
             "... today if technical questions arrive."
         ])
+    }
+
+    func testSoftUtteranceLimitWaitsForBriefSpeechBoundary() async {
+        let engine = SequencedSpeechTranslationEngine(
+            outcomes: [
+                .result(SpeechTranslationResult(text: "Nous préparons la démonstration", isFinal: false)),
+                .result(
+                    SpeechTranslationResult(
+                        text: "We are preparing the demonstration.",
+                        sourceText: "Nous préparons la démonstration.",
+                        isFinal: true
+                    )
+                )
+            ]
+        )
+        let coordinator = LiveSubtitleCoordinator(
+            engine: engine,
+            silenceGate: SilenceGate(rmsThreshold: 0.01, minimumSpeechDuration: 0.1),
+            sampleRate: sampleRate,
+            windowDuration: 1,
+            speechAnalysisDuration: 0.1,
+            minimumInferenceDuration: 0.25,
+            minimumProcessingInterval: 10,
+            maxUtteranceDuration: 2,
+            trailingSilenceDuration: 0.4,
+            maximumUtteranceDuration: 0.3,
+            hardMaximumUtteranceDuration: 1.0
+        )
+        let events = CaptionEventRecorder()
+        let model = testModel()
+
+        for index in 0..<8 {
+            await coordinator.handle(
+                chunk: chunk(amplitude: 0.05, index: index),
+                model: model,
+                languagePair: .frenchToEnglish,
+                emit: { events.append($0) }
+            )
+        }
+
+        XCTAssertFalse(events.values.contains { $0.kind == .final })
+
+        for index in 8..<10 {
+            await coordinator.handle(
+                chunk: chunk(amplitude: 0, index: index),
+                model: model,
+                languagePair: .frenchToEnglish,
+                emit: { events.append($0) }
+            )
+        }
+
+        XCTAssertEqual(
+            events.values.last(where: { $0.kind == .final })?.text,
+            "We are preparing the demonstration."
+        )
     }
 
     func testSourceDraftsSuppressNonSpeechHallucinations() async {
@@ -411,6 +499,76 @@ final class LiveSubtitleCoordinatorTests: XCTestCase {
         XCTAssertEqual(events.values.first { $0.kind == .sourceDraft }?.text, "Bonjour à tous")
     }
 
+    func testSourceDraftsSuppressRunawayPhraseRepetition() async {
+        let engine = SequencedSpeechTranslationEngine(
+            outcomes: [
+                .result(
+                    SpeechTranslationResult(
+                        text: "Nous devons revoir le planning de la planète de la planète de la planète de la planète",
+                        isFinal: false
+                    )
+                )
+            ]
+        )
+        let coordinator = LiveSubtitleCoordinator(
+            engine: engine,
+            silenceGate: SilenceGate(rmsThreshold: 0.01, minimumSpeechDuration: 0.2),
+            sampleRate: sampleRate,
+            windowDuration: 0.5,
+            speechAnalysisDuration: 0.25,
+            minimumInferenceDuration: 0.3,
+            minimumProcessingInterval: 10
+        )
+        let events = CaptionEventRecorder()
+        let model = testModel()
+
+        for index in 0..<8 {
+            await coordinator.handle(
+                chunk: chunk(amplitude: 0.05, index: index),
+                model: model,
+                languagePair: .frenchToEnglish,
+                emit: { events.append($0) }
+            )
+        }
+
+        XCTAssertFalse(events.values.contains { $0.kind == .sourceDraft })
+    }
+
+    func testSourceDraftsSuppressCommonWhisperFiller() async {
+        let engine = SequencedSpeechTranslationEngine(
+            outcomes: [
+                .result(
+                    SpeechTranslationResult(
+                        text: "Bonjour à tous, merci d'avoir regardé cette vidéo.",
+                        isFinal: false
+                    )
+                )
+            ]
+        )
+        let coordinator = LiveSubtitleCoordinator(
+            engine: engine,
+            silenceGate: SilenceGate(rmsThreshold: 0.01, minimumSpeechDuration: 0.2),
+            sampleRate: sampleRate,
+            windowDuration: 0.5,
+            speechAnalysisDuration: 0.25,
+            minimumInferenceDuration: 0.3,
+            minimumProcessingInterval: 10
+        )
+        let events = CaptionEventRecorder()
+        let model = testModel()
+
+        for index in 0..<8 {
+            await coordinator.handle(
+                chunk: chunk(amplitude: 0.05, index: index),
+                model: model,
+                languagePair: .frenchToEnglish,
+                emit: { events.append($0) }
+            )
+        }
+
+        XCTAssertFalse(events.values.contains { $0.kind == .sourceDraft })
+    }
+
     func testLowercaseContinuationDraftEmitsAfterForcedFinal() async {
         let engine = SequencedSpeechTranslationEngine(
             outcomes: [
@@ -444,6 +602,82 @@ final class LiveSubtitleCoordinatorTests: XCTestCase {
 
         let sourceDrafts = events.values.filter { $0.kind == .sourceDraft }.map(\.text)
         XCTAssertTrue(sourceDrafts.contains("que nous devons terminer la préparation"))
+    }
+
+    func testShortFinalUsesDualPassWhenLatestDraftDoesNotCoverSpeechEnd() async {
+        let engine = CoverageRecordingSpeechTranslationEngine()
+        let coordinator = LiveSubtitleCoordinator(
+            engine: engine,
+            silenceGate: SilenceGate(rmsThreshold: 0.01, minimumSpeechDuration: 0.1),
+            sampleRate: sampleRate,
+            windowDuration: 2,
+            speechAnalysisDuration: 0.1,
+            minimumInferenceDuration: 0.25,
+            minimumProcessingInterval: 10,
+            maxUtteranceDuration: 3,
+            trailingSilenceDuration: 0.2,
+            maximumUtteranceDuration: 2
+        )
+        let events = CaptionEventRecorder()
+        let model = testModel()
+
+        for index in 0..<20 {
+            await coordinator.handle(
+                chunk: chunk(amplitude: 0.05, index: index),
+                model: model,
+                languagePair: .frenchToEnglish,
+                emit: { events.append($0) }
+            )
+        }
+        for index in 20..<30 {
+            await coordinator.handle(
+                chunk: chunk(amplitude: 0, index: index),
+                model: model,
+                languagePair: .frenchToEnglish,
+                emit: { events.append($0) }
+            )
+        }
+
+        let preferences = await engine.finalPreferences()
+        XCTAssertEqual(preferences, [true])
+        XCTAssertTrue(events.values.contains { $0.kind == .final })
+    }
+
+    func testShortFinalKeepsFastPassWhenLatestDraftCoversSpeech() async {
+        let engine = CoverageRecordingSpeechTranslationEngine()
+        let coordinator = LiveSubtitleCoordinator(
+            engine: engine,
+            silenceGate: SilenceGate(rmsThreshold: 0.01, minimumSpeechDuration: 0.1),
+            sampleRate: sampleRate,
+            windowDuration: 2,
+            speechAnalysisDuration: 0.1,
+            minimumInferenceDuration: 0.25,
+            minimumProcessingInterval: 0,
+            maxUtteranceDuration: 3,
+            trailingSilenceDuration: 0.2,
+            maximumUtteranceDuration: 2
+        )
+        let model = testModel()
+
+        for index in 0..<20 {
+            await coordinator.handle(
+                chunk: chunk(amplitude: 0.05, index: index),
+                model: model,
+                languagePair: .frenchToEnglish,
+                emit: { _ in }
+            )
+        }
+        for index in 20..<30 {
+            await coordinator.handle(
+                chunk: chunk(amplitude: 0, index: index),
+                model: model,
+                languagePair: .frenchToEnglish,
+                emit: { _ in }
+            )
+        }
+
+        let preferences = await engine.finalPreferences()
+        XCTAssertEqual(preferences, [false])
     }
 
     private func makeCoordinator(engine: any SpeechTranslationEngine) -> LiveSubtitleCoordinator {
@@ -565,6 +799,52 @@ private actor FinalTimeoutSpeechTranslationEngine: SpeechTranslationEngine {
 
     func chunks() -> [PCMAudioChunk] {
         translatedChunks
+    }
+}
+
+private actor CoverageRecordingSpeechTranslationEngine: SpeechTranslationEngine {
+    private var preferences: [Bool] = []
+
+    func transcribe(
+        audio chunk: PCMAudioChunk,
+        model: InstalledModel,
+        languagePair: LanguagePair
+    ) async throws -> SpeechTranslationResult {
+        SpeechTranslationResult(
+            text: "Bonjour tout le monde",
+            sourceText: "Bonjour tout le monde",
+            isFinal: false
+        )
+    }
+
+    func translate(
+        audio chunk: PCMAudioChunk,
+        model: InstalledModel,
+        languagePair: LanguagePair
+    ) async throws -> SpeechTranslationResult {
+        SpeechTranslationResult(
+            text: "Hello everyone.",
+            sourceText: "Bonjour tout le monde",
+            isFinal: true
+        )
+    }
+
+    func translateFinal(
+        audio chunk: PCMAudioChunk,
+        model: InstalledModel,
+        languagePair: LanguagePair,
+        preferDualOutput: Bool
+    ) async throws -> SpeechTranslationResult {
+        preferences.append(preferDualOutput)
+        return SpeechTranslationResult(
+            text: "Hello everyone.",
+            sourceText: preferDualOutput ? "Bonjour tout le monde" : nil,
+            isFinal: true
+        )
+    }
+
+    func finalPreferences() -> [Bool] {
+        preferences
     }
 }
 

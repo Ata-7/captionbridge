@@ -17,15 +17,15 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.2.1</string>
+	<string>0.2.2</string>
 	<key>CFBundleVersion</key>
-	<string>3</string>
+	<string>4</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>14.0</string>
 	<key>NSAudioCaptureUsageDescription</key>
 	<string>CaptionBridge uses local system audio capture to translate meeting audio on this Mac without cloud upload or recording.</string>
 	<key>NSHumanReadableCopyright</key>
-	<string>Copyright © 2026 CaptionBridge.</string>
+	<string>Copyright © 2026 Mustafa Ataoğlu.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>CaptionBridge can listen to your microphone locally when you choose Microphone as the input source.</string>
 	<key>NSPrincipalClass</key>

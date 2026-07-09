@@ -29,6 +29,8 @@ public struct CaptionCandidate: Equatable, Sendable {
 public struct CaptionStabilizer {
     private var lastFinal = ""
     private var lastFinalAt = Date.distantPast
+    private var lastFinalStartTime: TimeInterval?
+    private var lastFinalEndTime: TimeInterval?
     private let duplicateSuppressionWindow: TimeInterval
 
     public init(duplicateSuppressionWindow: TimeInterval = 5) {
@@ -46,11 +48,25 @@ public struct CaptionStabilizer {
         }
 
         if normalized == lastFinal, date.timeIntervalSince(lastFinalAt) <= duplicateSuppressionWindow {
-            return nil
+            let rangesOverlap: Bool
+            if let candidateStart = candidate.startTime,
+               let candidateEnd = candidate.endTime,
+               let lastStart = lastFinalStartTime,
+               let lastEnd = lastFinalEndTime {
+                rangesOverlap = candidateStart <= lastEnd && lastStart <= candidateEnd
+            } else {
+                rangesOverlap = true
+            }
+
+            if rangesOverlap {
+                return nil
+            }
         }
 
         lastFinal = normalized
         lastFinalAt = date
+        lastFinalStartTime = candidate.startTime
+        lastFinalEndTime = candidate.endTime
         return .final(
             normalized,
             sourceText: candidate.sourceText,
@@ -63,6 +79,8 @@ public struct CaptionStabilizer {
     public mutating func clear(at date: Date = Date()) -> CaptionEvent {
         lastFinal = ""
         lastFinalAt = .distantPast
+        lastFinalStartTime = nil
+        lastFinalEndTime = nil
         return .cleared(at: date)
     }
 }

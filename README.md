@@ -31,8 +31,8 @@ I'm an operations/PMO professional rather than a professional developer — I bu
 
 - Speech recognition and translation run in a bundled [whisper.cpp](https://github.com/ggerganov/whisper.cpp) process with Metal GPU acceleration — on your Mac, offline.
 - Optional instant English drafts use Apple's on-device Translation framework (the language pack downloads once from Apple; translation itself is offline).
-- No analytics, no accounts, no network use except the one-time model download from Hugging Face.
-- Captions live in memory for the current session only; nothing is written to disk.
+- No analytics or accounts. Network access is limited to model downloads and, when enabled, Apple's one-time language-pack download.
+- In normal use captions live in memory for the current session only; no audio or transcript is written to disk.
 
 ## How it works
 
@@ -99,6 +99,33 @@ Scripts/verify-local-translation.sh
 
 `Scripts/verify-live-system-audio.sh` additionally exercises the full live system-audio path once Screen & System Audio Recording permission is granted.
 
+### Release signing and notarization
+
+Packaging remains ad-hoc by default, so the commands above keep working for local builds without certificates or Apple credentials. Every packaged app includes `LICENSE` and `THIRD-PARTY-NOTICES.md` in `Contents/Resources`; the DMG also exposes both files at its top level.
+
+For a Developer ID build, set the signing identity (and, only when needed, an explicit keychain):
+
+```sh
+export CAPTIONBRIDGE_CODESIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)"
+export CAPTIONBRIDGE_CODESIGN_KEYCHAIN="/path/to/signing.keychain-db" # optional
+Scripts/create-dmg.sh
+```
+
+To notarize that DMG and staple the accepted ticket, opt in with `CAPTIONBRIDGE_NOTARIZE=1`. A keychain profile keeps credentials out of the build environment:
+
+```sh
+xcrun notarytool store-credentials "captionbridge-notary" \
+  --apple-id "you@example.com" \
+  --team-id "TEAMID" \
+  --password "app-specific-password"
+
+export CAPTIONBRIDGE_NOTARIZE=1
+export CAPTIONBRIDGE_NOTARY_KEYCHAIN_PROFILE="captionbridge-notary"
+Scripts/create-dmg.sh
+```
+
+Non-interactive CI can omit the profile and instead provide all three of `CAPTIONBRIDGE_NOTARY_APPLE_ID`, `CAPTIONBRIDGE_NOTARY_TEAM_ID`, and `CAPTIONBRIDGE_NOTARY_PASSWORD`. Notarization fails before building if the Developer ID identity or required credentials are missing.
+
 ## Built with AI, deliberately
 
 This repository is also a demonstration of a working method: **product thinking + AI pair-programming**.
@@ -111,7 +138,7 @@ The point isn't that AI wrote the code. It's that a clear problem, honest verifi
 ## Roadmap
 
 - More language pairs (the pipeline is language-agnostic; UI and non-speech filters need generalizing)
-- Notarized releases with a Developer ID certificate (packaging already applies hardened runtime + timestamp when `CAPTIONBRIDGE_CODESIGN_IDENTITY` is set)
+- Publish release downloads signed and notarized with the documented Developer ID workflow
 - VoiceOver announcements and keyboard access for the overlay
 - Saved transcripts as an explicit opt-in export
 

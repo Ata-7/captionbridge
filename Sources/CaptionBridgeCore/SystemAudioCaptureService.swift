@@ -191,17 +191,10 @@ public final class SystemAudioCaptureService: NSObject, AudioCaptureService, @un
             throw AudioCaptureError.unsupportedFormat
         }
 
-        var didProvideInput = false
+        let inputProvider = AVAudioConverterInputProvider(buffer: input)
         var conversionError: NSError?
         converter.convert(to: output, error: &conversionError) { _, status in
-            if didProvideInput {
-                status.pointee = .noDataNow
-                return nil
-            }
-
-            didProvideInput = true
-            status.pointee = .haveData
-            return input
+            inputProvider.next(status: status)
         }
 
         if let conversionError {

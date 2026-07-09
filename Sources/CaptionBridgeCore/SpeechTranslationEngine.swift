@@ -254,7 +254,12 @@ public final class WhisperLiveTranslationEngine: SpeechTranslationEngine {
                 preferDualOutput: preferDualOutput
             )
         } catch WhisperEngineError.executableNotFound {
-            return try await fallbackEngine.translate(audio: chunk, model: model, languagePair: languagePair)
+            return try await fallbackEngine.translateFinal(
+                audio: chunk,
+                model: model,
+                languagePair: languagePair,
+                preferDualOutput: preferDualOutput
+            )
         }
     }
 
@@ -360,7 +365,7 @@ public final class PersistentWhisperTranslationEngine: SpeechTranslationEngine, 
         }
     }
 
-    private final class ResumeBox<T>: @unchecked Sendable {
+    private final class ResumeBox<T: Sendable>: @unchecked Sendable {
         private let lock = NSLock()
         private var didResume = false
 
@@ -389,6 +394,7 @@ public final class PersistentWhisperTranslationEngine: SpeechTranslationEngine, 
     private let finalTimeoutSeconds: TimeInterval
     private let coldStartExtraSeconds: TimeInterval
     private let stallKillInterval: TimeInterval
+    private let stallCheckInterval: TimeInterval
     private let requestQueue = DispatchQueue(label: "CaptionBridge.PersistentWhisperTranslationEngine")
     private let processState = ProcessState()
     private var requestCounter = 0
@@ -398,13 +404,15 @@ public final class PersistentWhisperTranslationEngine: SpeechTranslationEngine, 
         draftTimeoutSeconds: TimeInterval = 8,
         finalTimeoutSeconds: TimeInterval = 45,
         coldStartExtraSeconds: TimeInterval = 30,
-        stallKillInterval: TimeInterval = 25
+        stallKillInterval: TimeInterval = 25,
+        stallCheckInterval: TimeInterval = 5
     ) {
         self.locator = locator
         self.draftTimeoutSeconds = draftTimeoutSeconds
         self.finalTimeoutSeconds = finalTimeoutSeconds
         self.coldStartExtraSeconds = coldStartExtraSeconds
         self.stallKillInterval = stallKillInterval
+        self.stallCheckInterval = stallCheckInterval
     }
 
     deinit {
@@ -465,37 +473,41 @@ public final class PersistentWhisperTranslationEngine: SpeechTranslationEngine, 
         mode: HelperRequestMode
     ) async throws -> SpeechTranslationResult {
         let baseBudget = mode == .source ? draftTimeoutSeconds : finalTimeoutSeconds
-        let requestBudget = processState.hasRunningProcess ? baseBudget : baseBudget + coldStartExtraSeconds
-
         return try await withCheckedThrowingContinuation { continuation in
             let resumeBox = ResumeBox<SpeechTranslationResult>()
             requestQueue.async {
+                // Start this request's deadline when it actually reaches the
+                // serial worker. A previous slow request must not make queued
+                // work expire before it has even begun.
+                let requestBudget = self.processState.hasRunningProcess
+                    ? baseBudget
+                    : baseBudget + self.coldStartExtraSeconds
                 self.processState.setWorkerBusy(true)
+
+                DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + requestBudget) {
+                    let didTimeout = resumeBox.resume(
+                        continuation,
+                        with: .failure(WhisperEngineError.timedOut(seconds: requestBudget))
+                    )
+                    guard didTimeout else {
+                        return
+                    }
+
+                    // Keep a merely slow helper alive, but repeatedly check it
+                    // until progress resumes or the stall threshold is crossed.
+                    if self.processState.isStalled(beyond: self.stallKillInterval) {
+                        self.processState.terminate()
+                        self.processState.clear()
+                    } else {
+                        self.startStallWatchdogIfNeeded()
+                    }
+                }
+
                 let result = Result {
                     try self.performRequest(audio: chunk, model: model, languagePair: languagePair, mode: mode)
                 }
                 self.processState.setWorkerBusy(false)
                 resumeBox.resume(continuation, with: result)
-            }
-
-            DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + requestBudget) {
-                let didTimeout = resumeBox.resume(continuation, with: .failure(WhisperEngineError.timedOut(seconds: requestBudget)))
-                guard didTimeout else {
-                    return
-                }
-
-                // The caller has moved on, but the helper keeps the loaded
-                // model and finishes in the background; the next request
-                // drains the stale response. Only a genuine hang (no output
-                // progress at all) justifies killing the process — and a
-                // watchdog keeps checking so a hang is caught even if no
-                // further requests arrive.
-                if self.processState.isStalled(beyond: self.stallKillInterval) {
-                    self.processState.terminate()
-                    self.processState.clear()
-                } else {
-                    self.startStallWatchdogIfNeeded()
-                }
             }
         }
     }
@@ -689,7 +701,7 @@ public final class PersistentWhisperTranslationEngine: SpeechTranslationEngine, 
     }
 
     private func scheduleStallRecheck() {
-        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 5) { [weak self] in
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + stallCheckInterval) { [weak self] in
             guard let self else {
                 return
             }
@@ -746,6 +758,27 @@ public final class WhisperCLITranslationEngine: SpeechTranslationEngine {
         languagePair: LanguagePair
     ) async throws -> SpeechTranslationResult {
         try await run(audio: chunk, model: model, languagePair: languagePair, shouldTranslate: true)
+    }
+
+    public func translateFinal(
+        audio chunk: PCMAudioChunk,
+        model: InstalledModel,
+        languagePair: LanguagePair,
+        preferDualOutput: Bool
+    ) async throws -> SpeechTranslationResult {
+        guard preferDualOutput else {
+            return try await translate(audio: chunk, model: model, languagePair: languagePair)
+        }
+
+        let source = try await transcribe(audio: chunk, model: model, languagePair: languagePair)
+        let translated = try await translate(audio: chunk, model: model, languagePair: languagePair)
+        return SpeechTranslationResult(
+            text: translated.text,
+            sourceText: source.text,
+            startTime: translated.startTime,
+            endTime: translated.endTime,
+            isFinal: true
+        )
     }
 
     private func run(

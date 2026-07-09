@@ -155,7 +155,7 @@ public struct PCMAudioChunk: Equatable, Sendable {
 
 public typealias AudioChunkHandler = @Sendable (PCMAudioChunk) -> Void
 
-public protocol AudioCaptureService: AnyObject {
+public protocol AudioCaptureService: AnyObject, Sendable {
     var onChunk: AudioChunkHandler? { get set }
     /// Called when capture ends on its own (permission revoked, device gone,
     /// stream failure) rather than via stop().
